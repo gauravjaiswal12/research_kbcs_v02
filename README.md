@@ -85,7 +85,7 @@ KBCS achieves **statistically significant fairness improvements** in both topolo
 
 ## How It Works — System Architecture
 
-![KBCS-AQM System Architecture](kbcs_v2/plots/architecture.png)
+![KBCS-AQM System Architecture](kbcs_v2/plots/architecture_framework.png)
 
 KBCS operates as a three-tier system:
 
