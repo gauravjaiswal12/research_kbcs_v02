@@ -223,10 +223,10 @@ python3 controller/rl_controller.py --report > results/run_1.csv
 
 ## Key Research Contribution
 
-KBCS v2 is the **first AQM system that introduces long-term behavioral memory
-into the P4 data plane.** Every other AQM (RED, CoDel, P4air, CCQM) judges
-a flow only on what it is doing right now. KBCS judges a flow on what it has
-been doing over its entire lifetime in the network.
+KBCS v2 is a **novel AQM system that introduces long-term behavioral memory
+into the P4 data plane.** While modern AQMs (RED, CoDel, P4air, CCQM, PFQ) judge
+a flow primarily on instantaneous metrics, KBCS bridges this gap by evaluating
+a flow based on its historical behavior over its lifetime in the network.
 
 This one change — adding memory — enables two things no other system provides:
 1. **Resistance to gaming:** Bursty flows cannot escape punishment by briefly pausing.

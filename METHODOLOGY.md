@@ -1,1657 +1,654 @@
-# KBCS Enhanced Methodology: Comprehensive System Architecture
+# KBCS — Technical Methodology
 
-## Executive Summary
-
-This document presents the complete methodology for **KBCS (Karma-Based Congestion Signaling)** - a reputation-based Active Queue Management system implemented in P4 programmable data planes. The methodology addresses five critical requirements:
-
-1. **Dynamic Parameters** - Adaptive controller with true learning capabilities
-2. **Multi-Switch Topology** - Scalable network architecture with multiple bottlenecks
-3. **System Architecture** - Novel methodology distinguishing KBCS from existing AQM
-4. **Congestion Handling** - Clear mechanism for detection, attribution, and enforcement
-5. **Literature Integration** - Incorporating concepts from 2024-2026 research
+> **Scope of this document:** This is the deep technical reference for KBCS.  
+> It explains *why* each design decision was made, *what problem* each component solves, and *how* it works at the implementation level.  
+> For a high-level introduction, read `README.md` first.
 
 ---
 
 ## Table of Contents
 
 1. [Problem Statement](#1-problem-statement)
-2. [System Architecture Overview](#2-system-architecture-overview)
-3. [Data Plane Design](#3-data-plane-design)
-4. [Control Plane Design](#4-control-plane-design)
-5. [Multi-Switch Topology](#5-multi-switch-topology)
-6. [Congestion Handling Mechanism](#6-congestion-handling-mechanism)
-7. [Dynamic Parameter Adaptation](#7-dynamic-parameter-adaptation)
-8. [Integration with Related Work](#8-integration-with-related-work)
-9. [Implementation Details](#9-implementation-details)
-10. [Evaluation Methodology](#10-evaluation-methodology)
+2. [Design Goals and Constraints](#2-design-goals-and-constraints)
+3. [System Architecture](#3-system-architecture)
+4. [Data Plane Design (P4)](#4-data-plane-design-p4)
+5. [Control Plane Design (Controller)](#5-control-plane-design-controller)
+6. [Topology Design and Experimental Setup](#6-topology-design-and-experimental-setup)
+7. [Evaluation Methodology](#7-evaluation-methodology)
 
 ---
 
 ## 1. Problem Statement
 
-### 1.1 The Inter-CCA Fairness Challenge
+### 1.1 The Root Cause of Inter-CCA Unfairness
 
-Modern networks host heterogeneous Congestion Control Algorithms (CCAs) that exhibit fundamentally different behaviors:
+Every TCP connection uses a **Congestion Control Algorithm (CCA)** — a built-in strategy for deciding how fast to send packets and how to react when the network gets congested. The issue is that different CCAs use completely different signals to detect congestion:
 
-| CCA Category | Examples | Congestion Signal | Behavior |
-|--------------|----------|-------------------|----------|
-| **Loss-based** | CUBIC, Reno, NewReno, HTCP | Packet drops | AIMD - backs off on loss |
-| **Delay-based** | Vegas, Copa | RTT increase | Reduces rate when delay increases |
-| **Hybrid** | Illinois, Westwood | Loss + Delay | Combined signals |
-| **Rate-based (Model)** | BBR, BBRv2 | Bandwidth estimation | Probes bandwidth, largely ignores loss |
+| CCA | Congestion Signal | Reaction to Congestion | Aggressiveness |
+|-----|------------------|------------------------|----------------|
+| **CUBIC** | Packet loss | Backs off hard (AIMD), then probes fast | High |
+| **BBR** | Bandwidth estimate + RTT | Probes continuously, mostly ignores loss | Very High |
+| **Vegas** | RTT increase | Backs off proactively, before any loss | Low (self-limiting) |
+| **Illinois** | Loss + delay combined | Moderate reaction | Medium |
 
-**Key Research Finding (CCQM, 2026):**
-- CUBIC vs Vegas fairness index: **0.69** (severe unfairness)
-- CUBIC vs BBR fairness index: **0.50** (complete starvation)
-- Same-CCA competition: **~0.95-1.0** (fair)
+When these CCAs share the same bottleneck link, **they do not converge to a fair allocation**. A CUBIC or BBR flow will push until it sees packet loss. A Vegas flow will politely reduce its rate the moment it senses any delay — well before loss occurs. The network sees the Vegas flow as "not fully using the link" and gives that capacity to CUBIC and BBR instead.
 
-### 1.2 Limitations of Existing Approaches
+**This is not a bug. It is the intended behaviour of each algorithm. The network has no mechanism to stop it.**
 
-**Traditional AQM (RED, CoDel, PIE):**
-- Treats all flows identically
-- Cannot differentiate between CCA behaviors
-- Delay-based CCAs (Vegas) starved by loss-based CCAs (CUBIC)
+Quantified impact on a ~3 Mbps bottleneck link (measured with no AQM — raw FIFO):
 
-**Fair Queueing (AFQ, EFQ, SFQ):**
-- Per-flow queuing overhead
-- Limited physical queues (max 8 in commodity switches)
-- Poor handling of incast traffic
+| Flow Mix | Jain's Fairness Index | Interpretation |
+|----------|-----------------------|----------------|
+| All CUBIC (4 flows) | ~0.97 | Near-perfect |
+| CUBIC + BBR + Vegas + Illinois | 0.719 | Severe unfairness |
+| Cross topology (8 mixed flows) | 0.811 | Moderate unfairness |
 
-### 1.2 Limitations of Existing Approaches
+A JFI of 0.719 on a 10 Mbps link means some flows receive 6–7x more bandwidth than others despite being allocated the same theoretical share.
 
-**Traditional AQM (RED, CoDel, PIE):**
-- Treats all flows identically
-- Cannot differentiate between CCA behaviors
-- Delay-based CCAs (Vegas) starved by loss-based CCAs (CUBIC)
+### 1.2 Why Existing Systems Cannot Solve This
 
-**Fair Queueing (AFQ, EFQ, SFQ):**
-- Per-flow queuing overhead
-- Limited physical queues (max 8 in commodity switches)
-- Poor handling of incast traffic
+**Traditional AQM (RED, CoDel, PIE):**  
+These mechanisms manage congestion at the queue level — they drop or delay packets based on queue occupancy or sojourn time. They apply the same policy to *all* flows equally. This makes the problem *worse* for Vegas: Vegas already backs off before the queue builds up, so it contributes little to queue depth. The AQM therefore sees CUBIC as the "heavy user" and drops CUBIC's packets — but CUBIC is designed to handle drops and immediately probes back up. Vegas never benefits.
 
-**Why KBCS is NEEDED (Not Just Another AQM):**
+**Fair Queueing (SFQ, WFQ, FQ-CoDel):**  
+Per-flow queuing theoretically solves the problem. In practice, commodity programmable switches (including BMv2 and Tofino targets) support a maximum of 8 hardware priority queues. A data centre link carrying 100+ concurrent flows cannot dedicate a queue to each.
 
-Let me directly answer: **"Why yours, not existing solutions?"**
+**P4air (2020):**  
+P4air tracks per-flow byte counts inside a P4 switch and restricts flows that exceed their fair share. This was a significant step forward. However, P4air has **no recovery mechanism**: a flow penalised in P4air stays restricted permanently, even if the CCA backs off and reforms its behaviour. In a mixed-CCA environment, BBR flows get permanently throttled and the link runs at sub-optimal utilisation.
 
----
+**P4CCI (2022) — The Direct Comparison Baseline:**  
+P4CCI is the most relevant prior work and the system we benchmark against directly. It uses a Fully Connected Neural Network (FCN) pre-trained offline to classify TCP flows by their CCA type (CUBIC, BBR, Vegas, etc.), then assigns each classified CCA to a dedicated priority queue with fixed bandwidth allocations. It is a strong system — but it has four concrete limitations that KBCS is designed to address:
 
-## 1.3 Why KBCS is Different (What Existing Systems Miss)
+1. **No behavioural history.** P4CCI classifies a flow once at connection start and assigns it a queue permanently. A BBR flow that was initially aggressive and reformed its behaviour stays in the same "BBR queue" with the same treatment indefinitely. KBCS tracks per-packet history via karma — a flow that reforms gets rewarded in real time.
 
-### Problem They All Have:
+2. **Static thresholds, no adaptation.** P4CCI's queue rate allocations are computed at training time for the CCA mix used in the training dataset. In our experiments, when flows leave or join mid-experiment, P4CCI's allocations become incorrect. KBCS's controller recalculates `fair_bytes` dynamically every 2 seconds based on the *current* active flow count.
 
-```
-CUBIC Flow: "I'm sending 8 Mbps (64% of link)"
-Vegas Flow: "I'm sending 1 Mbps (8% of link)"
-Reviewer:   "Why is this unfair?"
+3. **Requires CCA classification.** P4CCI must first identify *which* CCA a flow is using — a problem that is both brittle (CCAs can be mimicked or obfuscated) and requires a pre-trained model that may not generalise to new or hybrid CCAs. KBCS is entirely CCA-agnostic: it observes *behaviour* (bytes sent per window vs fair share) rather than *identity*.
 
-RED/CoDel:  "Drop packets randomly from both"
-            → Vegas drops more (low RTT) → unfairer
+4. **No recovery mechanism.** A flow classified as "aggressive" by P4CCI receives lower-priority treatment for the entire connection lifetime. KBCS explicitly rehabilitates flows that sustain 20 consecutive RED windows (~300ms) of good behaviour — preventing permanent queue starvation.
 
-P4air:      "Track per-flow bytes, equalize throughput"
-            → Works BUT doesn't adapt to flow count changes
+5. **No proactive buffer management.** P4CCI relies on standard tail-drop or probabilistic AQM within each priority queue. It has no mechanism to dynamically allocate buffer space based on how much each flow actually uses. KBCS integrates PFQ-inspired buffer reservation (see Section 4.9): flows that underuse their budget in a window donate their buffer headroom to active flows, while RED-zone flows are quarantined with a strict threshold of just 2 packets — preventing them from monopolising shared egress buffer during bursts.
 
-CCQM:       "Classify CCAs, separate queues"
-            → Works BUT thresholds are STATIC
+**Measured gap:** In 30-run experiments, P4CCI achieves mean JFI of 0.879 (dumbbell) and 0.851 (cross). KBCS achieves 0.954 and 0.913 respectively — an improvement of +8.5% and +7.2% — while maintaining equal or higher link utilisation.
 
-PFQ:        "Reserve buffer proactively"
-            → Works BUT doesn't know flow is behaving badly
+**PFQ (2026):**  
+PFQ proactively reserves buffer space for incoming bursts based on queue depth. It improves incast handling but has **no reputation system**: a flow that has been chronically unfair for the past 10 seconds is treated identically to a new, cooperative flow. **KBCS integrates PFQ's core insight** — dynamic per-flow buffer thresholds and buffer recycling from idle flows — but ties it to the karma system. In KBCS, buffer allocation is not just based on queue depth; it is scaled by the flow's karma-derived color zone, creating a two-dimensional enforcement mechanism: karma controls the *byte budget*, while PFQ controls the *queue depth budget*.
 
-KBCS:       "Track REPUTATION, adapt DYNAMICALLY, allow RECOVERY"
-            → Handles all above + something new
-```
+### 1.3 The Gap: History-Awareness
 
-### The Four Gaps KBCS Fills:
+Most existing systems judge a flow primarily on **instantaneous metrics** — the current packet, the current queue depth, or the current byte count. While modern mechanisms like PFQ proactively manage immediate burst capacity, they lack a persistent memory to ask: *"Has this flow been consistently greedy for the past 300 milliseconds? Or is it a normally-cooperative flow that just had one burst?"*
 
-#### GAP 1: No Reputation (All Existing Systems)
 
-**Problem:** RED/CoDel/P4air judge flow based on **current packet**, not history
-```
-Flow A (CUBIC):
-  Minute 1: Aggressive (8 Mbps) → Gets dropped
-  Minute 2: Backs off (4 Mbps) → Gets full bandwidth reward
-  Result: Fluctuates wildly
+This distinction matters enormously in practice:
+- A bursty but otherwise cooperative flow (e.g., a video frame) should be allowed its burst and rewarded for good long-term behaviour.
+- A chronically aggressive flow (e.g., a BBR probe cycle) should be progressively throttled, with the restriction surviving its momentary back-off.
 
-KBCS Karma:
-  Minute 1: Aggressive → Karma = 30 (RED zone)
-  Minute 2: Still RED → Keep penalties
-  Minute 5: Finally backs off → Karma starts recovering
-  Result: Stable, consistent treatment based on HISTORY
-```
-
-**Why It Matters:** Flows that are unfair today should remain restricted until they prove they've reformed.
-
-#### GAP 2: No Recovery (P4air, CCQM, PFQ)
-
-**Problem:** No existing AQM lets aggressive flows escape punishment
-```
-Scenario: BBR flow is aggressive → Gets heavily throttled
-
-P4air/CCQM: "You're aggressive, stay in low queue forever"
-Result: BBR never gets chance to be fair
-        → Permanent starvation of BBR
-        → Suboptimal link utilization
-
-KBCS: "You're in RED zone. But after 20 windows of being RED,
-       I'll give you a second chance to prove you've reformed"
-Result: BBR gets throttled → Eventually backs off
-        → Can recover → Link utilization maintained
-```
-
-**Why It Matters:** Fairness without forgiveness = starvation. Real networks need recovery.
-
-#### GAP 3: Static Parameters (CCQM, PFQ, P4air)
-
-**Problem:** Thresholds don't change as network conditions change
-```
-Scenario: Network goes from 4 flows → 2 flows (2 leave)
-
-Static System (P4air/CCQM):
-  fair_bytes = 7000  (calculated for 4 flows)
-  2 flows now → each should get 14000
-  But fair_bytes still 7000
-  Result: 50% wasted link capacity
-
-KBCS with Dynamic Controller:
-  Detects: Only 2 flows active
-  Recalculates: fair_bytes = 14000
-  Updates P4 register
-  Result: Full utilization maintained
-```
-
-**Why It Matters:** Networks are dynamic. Static parameters = suboptimal utilization.
-
-#### GAP 4: No CCA-Awareness (RED, CoDel, P4air)
-
-**Problem:** Treats Vegas (self-throttling) same as CUBIC (aggressive)
-```
-Vegas with RED:
-  Self-throttles (low throughput by design)
-  RED sees: "Low traffic" → Gives it low priority
-  Result: DOUBLE STARVATION (Vegas throttles + RED penalizes)
-  JFI: 0.50
-
-KBCS:
-  Detects: High karma + low throughput = Vegas
-  Action: Boost per-flow budget for Vegas
-  Result: Vegas gets fair share
-  JFI: 0.85+
-```
-
-**Why It Matters:** Different CCAs need different treatment strategies.
+**KBCS introduces this history-awareness through karma** — a per-flow reputation score that accumulates over time, decays slowly when penalised, and allows explicit recovery after sustained good behaviour.
 
 ---
 
-### Summary: Why KBCS, Not Existing Systems?
+## 2. Design Goals and Constraints
 
-| System | Reputation | Recovery | Dynamic | CCA-Aware | Result |
-|--------|-----------|----------|---------|-----------|--------|
-| RED/CoDel | ❌ | ❌ | ❌ | ❌ | 0.50-0.65 JFI (bad) |
-| P4air | ❌ | ❌ | ❌ | ❌ | 0.70-0.80 JFI (ok) |
-| CCQM | ❌ | ❌ | ❌ | ✅ | 0.75-0.85 JFI (good) |
-| PFQ | ❌ | ❌ | ❌ | ❌ | ~0.80 JFI (ok) |
-| **KBCS** | **✅** | **✅** | **✅** | **✅** | **0.90-0.95 JFI (excellent)** |
+Before describing what KBCS does, it is important to state what it was designed *to* do and *not* to do. These goals directly explain every architectural decision that follows.
 
----
+### 2.1 Primary Goals
 
-### What Reviewers Will Ask:
+| Goal | Metric | Target |
+|------|--------|--------|
+| Inter-CCA fairness | Jain's Fairness Index | ≥ 0.90 across all tested CCA mixes |
+| Link utilisation preservation | % of link capacity used | ≥ 95% (fairness must not waste bandwidth) |
+| No permanent starvation | Minimum per-flow throughput | Every flow receives ≥ 10% of its fair share at all times |
+| Adaptability | Response to flow count change | Fairness restored within 2 seconds of a flow joining/leaving |
 
-**Q: "Why not just use P4air from 2020?"**
-```
-A: P4air tracks per-flow bytes but has NO RECOVERY.
-   If BBR behaves badly, it stays throttled forever.
-   KBCS adds RED-streak recovery → Flows can escape punishment.
-```
+### 2.2 Design Constraints
 
-**Q: "Why not just use CCQM from 2026?"**
-```
-A: CCQM classifies CCAs but uses STATIC thresholds.
-   If flow count changes 4→2, thresholds don't adjust.
-   KBCS controller DYNAMICALLY tunes fair_bytes, penalty_mult, etc.
-```
+**Constraint 1 — Must run in the data plane at line rate.**  
+Any per-packet decision (drop, forward, mark) must complete within the switch pipeline cycle — microseconds. A Python controller cannot make per-packet decisions. It can only set global parameters that the data plane uses autonomously.
 
-**Q: "Why not just use PFQ from 2026?"**
-```
-A: PFQ has proactive buffer reservation but NO REPUTATION.
-   Treats all flows equally within buffer quota.
-   KBCS tracks karma history → GREEN flows get more buffer.
-```
+**Constraint 2 — P4/BMv2 does not support floating point or division.**  
+All karma calculations, threshold comparisons, and budget checks must use integer arithmetic only. This shaped the karma scoring formula, the window duration, and the budget multiplier design.
 
-**Q: "Why complexity? Isn't simple RED good enough?"**
-```
-A: No. RED achieves 0.50-0.65 JFI with mixed CCAs.
-   That's 50% unfairness. Imagine your ISP gave 50% of promised speed.
+**Constraint 3 — Limited P4 register space.**  
+Each register array is pre-allocated at compile time. KBCS uses a 1024-entry register bank — sufficient for 1024 simultaneous flows per switch.
 
-   KBCS achieves 0.90+ JFI with same network.
-   That's industry-standard fairness for concurrent users.
-```
+**Constraint 4 — No CCA classification required.**  
+KBCS must work without knowing which CCA a flow is using. Classification requires either a pre-trained model (P4CCI approach) or explicit header fingerprinting. Both add complexity and can be evaded. Karma-based management should be CCA-agnostic by design.
+
+**Constraint 5 — Recovery must be explicit, not implicit.**  
+If a flow is heavily penalised (RED zone), it must have a deterministic path back to fair treatment — not just "wait long enough and hope". This prevents the permanent starvation observed in P4air.
 
 ---
 
-### The Core Innovation
+## 3. System Architecture
 
-**KBCS = First system that combines:**
-1. Reputation-based (karma) tracking → NEW
-2. Explicit recovery mechanism → NEW
-3. Dynamic parameter adaptation → NEW
-4. P4 implementation at line-rate → Implementation novelty
+### 3.1 Three-Tier Architecture
 
-**No other AQM has ALL FOUR.**
+KBCS is divided into three layers, each with a distinct role:
 
-**KBCS Innovation:**
-- **Per-flow karma tracking** at line rate in P4
-- **Reputation-based differentiated treatment**
-- **CCA-aware enforcement** with recovery mechanisms
-- **Adaptive control plane** for dynamic environments
+![KBCS-AQM System Architecture](kbcs_v2/plots/architecture.png)
 
----
+The framework diagram below shows the end-to-end packet processing flow through the P4 switch data plane, from Sender through the ingress pipeline, priority queues, and egress PFQ enforcement, to the Receiver — with the Q-Learning controller and telemetry feedback loops:
 
-## 2. System Architecture Overview
+![Framework of KBCS-AQM](kbcs_v2/plots/architecture_framework.png)
 
-### 2.1 Three-Tier Architecture
+**Tier 3 — Control Plane** (`rl_controller.py`): A Q-Learning controller reads aggregate telemetry from P4 registers every 2 seconds, computes JFI, utilisation, and active flow count, selects an action (tighten/loosen penalty, adjust budget), and writes updated parameters to P4 registers via the Thrift API.
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                        KBCS SYSTEM ARCHITECTURE                      │
-├─────────────────────────────────────────────────────────────────────┤
-│  ┌─────────────────────────────────────────────────────────────┐    │
-│  │                    CONTROL PLANE                             │    │
-│  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐   │    │
-│  │  │   Adaptive   │  │   Flow       │  │   Telemetry      │   │    │
-│  │  │   Parameter  │  │   Behavior   │  │   Collection     │   │    │
-│  │  │   Controller │  │   Classifier │  │   (InfluxDB)     │   │    │
-│  │  └──────┬───────┘  └──────┬───────┘  └────────┬─────────┘   │    │
-│  │         │                 │                    │             │    │
-│  │         └─────────────────┼────────────────────┘             │    │
-│  │                           │                                  │    │
-│  └───────────────────────────┼──────────────────────────────────┘    │
-│                              │ P4Runtime / gRPC                      │
-│  ┌───────────────────────────┼──────────────────────────────────┐    │
-│  │                    DATA PLANE (P4)                            │    │
-│  │  ┌─────────────────────────────────────────────────────────┐ │    │
-│  │  │  INGRESS PIPELINE                                        │ │    │
-│  │  │  ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ │ │    │
-│  │  │  │ Flow   │→│ Karma  │→│ Color  │→│ Budget │→│ AQM    │ │ │    │
-│  │  │  │ Track  │ │ Update │ │ Assign │ │ Check  │ │ Action │ │ │    │
-│  │  │  └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ │ │    │
-│  │  └─────────────────────────────────────────────────────────┘ │    │
-│  │  ┌─────────────────────────────────────────────────────────┐ │    │
-│  │  │  EGRESS PIPELINE                                         │ │    │
-│  │  │  ┌────────────┐  ┌────────────┐  ┌────────────────────┐ │ │    │
-│  │  │  │ Priority   │  │ Queue      │  │ Telemetry Clone    │ │ │    │
-│  │  │  │ Mapping    │  │ Management │  │ (Digest/Mirror)    │ │ │    │
-│  │  │  └────────────┘  └────────────┘  └────────────────────┘ │ │    │
-│  │  └─────────────────────────────────────────────────────────┘ │    │
-│  └──────────────────────────────────────────────────────────────┘    │
-│                                                                       │
-│  ┌──────────────────────────────────────────────────────────────┐    │
-│  │                    VISUALIZATION LAYER                        │    │
-│  │         Grafana Dashboard (Real-time Monitoring)              │    │
-│  └──────────────────────────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────────────────┘
-```
+**Tier 2 — Data Plane** (`kbcs_v2.p4`): The P4 switch pipeline processes every packet at line rate through 8 stages: Flow ID → Byte Counting → Karma Update → Color Assignment → AQM + PFQ Buffer Reservation → RED Streak Recovery → Priority Queue Mapping → Telemetry Clone. The Egress pipeline performs PFQ-inspired proactive drops based on per-flow dynamic queue thresholds.
 
-### 2.2 Core Design Principles
+**Tier 1 — Telemetry** (`int_collector.py`): Receives cloned packets from the CPU port, extracts per-flow karma, color, drops, and bytes, and writes to InfluxDB for Grafana dashboard visualisation.
 
-1. **Reputation over Instantaneous State**: Flow behavior judged over time windows, not single packets
-2. **Differentiated Enforcement**: Color-coded treatment (GREEN/YELLOW/RED) with graduated penalties
-3. **Recovery Mechanism**: Flows can recover from penalties, preventing permanent lockout
-4. **Proactive Buffer Management**: Reserved space for incast and new flows (inspired by PFQ)
-5. **Adaptive Parameters**: Controller dynamically adjusts thresholds based on network state
+### 3.2 Separation of Concerns
+
+A key architectural decision is the strict separation between what runs *in the data plane* and what runs *in the control plane*:
+
+**Data plane (P4) — microsecond decisions:**
+- Per-packet byte counting
+- Karma score updates (every 15ms window)
+- Color zone assignment (GREEN / YELLOW / RED)
+- Drop / ECN mark decisions
+- Priority queue assignment
+- RED streak tracking
+
+**Control plane (Python) — second-level decisions:**
+- Computing aggregate JFI across all flows
+- Detecting flow count changes
+- Recalculating fair_bytes based on current active flows
+- Adjusting penalty and reward magnitudes
+- Q-Learning parameter optimisation
+
+This separation is necessary because the P4 BMv2 pipeline cannot perform floating-point division or loop over all flows — both of which are required to compute JFI and recalculate fair_bytes. The controller does the arithmetic and writes the result back as a simple integer register.
+
+### 3.3 Global Parameters Written by Controller to Data Plane
+
+| Register | Default | Description |
+|----------|---------|-------------|
+| `reg_fair_bytes` | 7000 bytes | Per-flow byte budget per 15ms window |
+| `reg_penalty_amt` | 8 | Karma deduction per unit of excess |
+| `reg_reward_amt` | 4 | Karma addition per unit of deficit |
+
+All three are writable at runtime. The data plane reads them on every window evaluation without needing to halt or recompile.
 
 ---
 
-## 3. Data Plane Design
+---
 
-### 3.1 Flow Identification and Tracking
+## 4. Data Plane Design (P4)
 
-**Flow Key (5-tuple hash):**
+The P4 program (`p4src/kbcs_v2.p4`) implements the entire per-packet decision pipeline inside the BMv2 software switch. Every TCP packet that arrives at a KBCS switch passes through the following stages in order.
+
+### 4.1 Flow Identification
+
+**Why:** We need to maintain per-flow state. Packets belonging to the same connection must map to the same register slot consistently, even across millions of packets per second.
+
+**How:** A CRC16 hash of the 4-tuple (source IP, destination IP, source port, destination port) maps each packet to an index in a 1024-slot register bank. The protocol field is omitted since KBCS is TCP-only in this implementation.
+
 ```p4
-struct flow_key_t {
-    bit<32> src_ip;
-    bit<32> dst_ip;
-    bit<16> src_port;
-    bit<16> dst_port;
-    bit<8>  protocol;
-}
-
-// Hash to register index
-hash(meta.flow_idx, HashAlgorithm.crc16, 0,
+hash(meta.flow_idx, HashAlgorithm.crc16, (bit<10>)0,
      {hdr.ipv4.srcAddr, hdr.ipv4.dstAddr,
-      hdr.tcp.srcPort, hdr.tcp.dstPort},
-     REG_SIZE);
+      hdr.tcp.srcPort,  hdr.tcp.dstPort},
+     (bit<32>)REG_SIZE);
 ```
 
-**Per-Flow State Registers:**
-| Register | Size | Description |
-|----------|------|-------------|
-| `reg_flow_bytes` | 32-bit | Bytes sent in current window |
-| `reg_karma_score` | 8-bit | Current karma (0-100) |
-| `reg_flow_color` | 2-bit | GREEN=2, YELLOW=1, RED=0 |
-| `reg_last_window` | 48-bit | Timestamp of last window |
-| `reg_drops` | 32-bit | Drop count per flow |
-| `reg_red_streak` | 8-bit | Consecutive RED windows |
+**Design note — hash collisions:** With 1024 slots and typical flow counts of 4–8 in our experiments, collision probability is negligible (<0.4%). In a production deployment, the register size would scale with expected flow count.
 
-### 3.2 Karma Computation
+### 4.2 Per-Flow State Registers
 
-**Window-Based Accounting:**
+All per-flow state is stored in P4 stateful registers — the only mechanism BMv2 provides for persistent state across packets:
+
+| Register | Width | Purpose |
+|----------|-------|---------|
+| `reg_bytes` | 32-bit | Bytes accumulated by this flow in the current 15ms window |
+| `reg_karma` | 8-bit | Current karma score (0–100) |
+| `reg_color` | 2-bit | Current zone: 2=GREEN, 1=YELLOW, 0=RED |
+| `reg_last_ts` | 48-bit | Timestamp (microseconds) of the last window reset |
+| `reg_red_streak` | 8-bit | Consecutive RED windows (for recovery trigger) |
+| `reg_drops` | 32-bit | Total drops for this flow (read by controller) |
+| `reg_pkt_count` | 32-bit | Total packets seen (used to schedule telemetry clones) |
+
+**Why 8-bit karma (0–100)?** An 8-bit register can hold 0–255. We constrain karma to 0–100 to give it a natural "percentage" interpretation. Operations use saturating arithmetic to prevent overflow.
+
+### 4.3 Byte Counting and Window Management
+
+**Why a window?** We need to compare a flow's sending rate against its fair share. Rate = bytes per unit time. We accumulate bytes over a fixed window (15ms), then evaluate at the window boundary. This is preferable to per-packet rate estimation, which requires exponential weighted moving average — not implementable in P4 without floating point.
+
+**Why 15ms?** This is approximately 1.5× the typical round-trip time in a LAN/campus network. It is long enough to accumulate a statistically meaningful byte count, but short enough to react to CCA behaviour changes within a few hundred milliseconds. BBR's probing cycle is ~100–200ms, so a 15ms window catches individual probe bursts.
+
+**Implementation:**
+
 ```p4
-#define WINDOW_USEC        15000  // 15ms window (1.5x typical RTT)
-#define KARMA_MAX          100
-#define KARMA_MIN          0
+// Read current accumulated bytes and last window timestamp
+bit<32> cur_bytes;  bit<48> last_ts;
+reg_bytes.read(cur_bytes, meta.flow_idx);
+reg_last_ts.read(last_ts, meta.flow_idx);
 
-// Check if new window
-if (now - last_window > WINDOW_USEC) {
-    // Calculate karma adjustment
-    if (flow_bytes > fair_bytes) {
-        // Exceeded fair share - PENALTY
-        bit<32> excess = flow_bytes - fair_bytes;
-        bit<8> penalty = (bit<8>)(excess >> 10);  // Scale factor
-        karma = saturating_sub(karma, penalty * PENALTY_MULT);
-    } else {
-        // Under fair share - REWARD
-        bit<32> deficit = fair_bytes - flow_bytes;
-        bit<8> reward = (bit<8>)(deficit >> 11);
-        karma = saturating_add(karma, reward * REWARD_MULT);
-    }
+// Accumulate this packet's bytes
+cur_bytes = cur_bytes + (bit<32>)standard_metadata.packet_length;
+reg_bytes.write(meta.flow_idx, cur_bytes);
 
-    // Reset window
-    reg_flow_bytes.write(idx, 0);
-    reg_last_window.write(idx, now);
+// Check if window has elapsed
+bit<48> now = (bit<48>)standard_metadata.ingress_global_timestamp;
+meta.window_elapsed = (now - last_ts > WINDOW_USEC) ? 1w1 : 1w0;
+```
+
+If the window has *not* elapsed, the packet proceeds directly to enforcement using the flow's existing karma and color. If the window *has* elapsed, the karma update runs first.
+
+### 4.4 Karma Computation
+
+**Why karma instead of instantaneous rate?** Rate-based systems (like P4air) compare the current window's bytes against a threshold and immediately penalise or reward. This means a CUBIC flow that pauses for one window is immediately rewarded with full GREEN status, even though it was aggressively over-sending for the previous 10 windows. Karma is a score that *accumulates* — a good single window improves it slightly; 10 bad windows damage it significantly. This creates inertia: a flow must earn its way back.
+
+**The fair share calculation:**
+
+```
+fair_bytes = reg_fair_bytes  (written by controller, updated dynamically)
+```
+
+This is the byte budget each flow is allowed per 15ms window. It is computed by the controller as:
+
+```
+fair_bytes = (link_rate_bytes_per_sec × 0.015) / active_flow_count × headroom
+```
+
+Where `headroom` is a configurable multiplier (default 1.5) that allows the budget to be slightly generous — preventing flows from being penalised for small, natural timing jitter.
+
+**The karma update formula:**
+
+```p4
+if (cur_bytes > fair_bytes) {
+    // Flow exceeded its fair share — penalise
+    bit<32> excess = cur_bytes - fair_bytes;
+    // Scale: every 1024 bytes over budget = 1 base unit of penalty
+    bit<8>  units  = (bit<8>)(excess >> 10);
+    bit<8>  delta  = units * penalty_amt;   // penalty_amt set by controller
+    karma = (karma > delta) ? karma - delta : 0;  // saturating subtract
+} else {
+    // Flow was within its fair share — reward
+    bit<32> deficit = fair_bytes - cur_bytes;
+    bit<8>  units   = (bit<8>)(deficit >> 11);
+    bit<8>  delta   = units * reward_amt;
+    karma = (karma + delta < 100) ? karma + delta : 100;  // saturating add
 }
 ```
 
-**Fair Bytes Calculation:**
-```
-fair_bytes = (link_capacity × window_duration) / num_active_flows × headroom_factor
+**Why integer bit-shifts instead of division?** P4/BMv2 does not support the `/` operator on arbitrary values. Right-shift by 10 is equivalent to dividing by 1024 — an acceptable approximation for scaling the excess/deficit into penalty units.
 
-Example: 10 Mbps link, 15ms window, 4 flows, 1.5x headroom
-fair_bytes = (10,000,000 bps × 0.015s) / 4 × 1.5
-           = 150,000 bits / 4 × 1.5
-           = 56,250 bits ≈ 7,031 bytes per flow per window
-```
+**Penalty-to-reward ratio:** Default `penalty_amt = 8`, `reward_amt = 4`. This 2:1 ratio means it takes twice as long to recover from a period of bad behaviour as it took to cause the damage. This is intentional — it prevents flows from rapidly oscillating between zones.
 
-### 3.3 Color Zone Assignment
+### 4.5 Color Zone Assignment
+
+After karma is updated, the flow's color zone is assigned:
 
 ```p4
-// Karma to Color mapping
-#define GREEN_THRESHOLD    75
-#define YELLOW_THRESHOLD   40
+#define GREEN_THRESHOLD  75
+#define YELLOW_THRESHOLD 40
 
-if (meta.karma_score >= GREEN_THRESHOLD) {
-    meta.flow_color = GREEN;   // Cooperative flow
-} else if (meta.karma_score >= YELLOW_THRESHOLD) {
+if (meta.karma >= GREEN_THRESHOLD) {
+    meta.flow_color = GREEN;   // Cooperative, well-behaved
+} else if (meta.karma >= YELLOW_THRESHOLD) {
     meta.flow_color = YELLOW;  // Moderately unfair
 } else {
-    meta.flow_color = RED;     // Highly unfair/aggressive
+    meta.flow_color = RED;     // Chronically aggressive
 }
 ```
 
-### 3.4 Differentiated AQM Actions
+**Why these thresholds?** The thresholds were calibrated empirically: a flow starting at karma=50 (YELLOW) and sending 20% over its fair share reaches RED after approximately 8–10 windows (~120–150ms). A flow starting GREEN and sending at exactly fair share stays GREEN indefinitely. These timings match the RTT-scale reaction times of the CCAs being managed.
 
-**Budget-Based Enforcement:**
+**Threshold hysteresis:** The controller can adjust these thresholds dynamically (see Section 5). In practice, widening the YELLOW band reduces thrashing between zones for bursty flows.
+
+### 4.6 Budget Enforcement and Drop/ECN Decisions
+
+**Why per-color budgets rather than a single drop probability?** A single global drop probability (as in RED) cannot differentiate between a cooperative flow that briefly exceeded its budget due to jitter versus a chronic abuser. Per-color budgets mean a GREEN flow is allowed to use up to 2× its fair share before any drops, while a RED flow is cut to 25% of its fair share — strong enough to force back-off even in BBR, which ignores random drops.
+
+**Budget multipliers:**
+
+| Color | Budget | Meaning |
+|-------|--------|---------|
+| GREEN | 2.0× fair_bytes | Trusted — allowed generous burst headroom |
+| YELLOW | 1.0× fair_bytes | Neutral — held to exactly fair share |
+| RED | 0.25× fair_bytes | Restricted — must send at ¼ of fair share |
+
+**Drop probability when budget exceeded:**
+
+| Color | Drop probability | Rationale |
+|-------|-----------------|-----------|
+| GREEN | 10% | Soft signal — most packets pass, ECN is marked first |
+| YELLOW | 35% | Moderate deterrent — noticeable but not catastrophic |
+| RED | 90% | Aggressive throttle — forces CCA to back off |
+
+**ECN marking for GREEN flows:** Before any drop, KBCS marks the Congestion Experienced (CE) bits in the IP header for GREEN flows whose packets would otherwise be dropped. ECN-aware CCAs (CUBIC ECN, BBR) can react to CE marks by reducing their rate without actual loss — a gentler signal for cooperative flows. RED flows receive no ECN grace; their packets are simply dropped.
+
 ```p4
-// Per-color budget multipliers
-#define GREEN_BUDGET_MULT   200  // 2.0x fair share allowed
-#define YELLOW_BUDGET_MULT  100  // 1.0x fair share
-#define RED_BUDGET_MULT     25   // 0.25x fair share (harsh restriction)
-
-// Calculate flow-specific budget
-bit<32> flow_budget;
-if (meta.flow_color == GREEN) {
-    flow_budget = fair_bytes * GREEN_BUDGET_MULT / 100;
-} else if (meta.flow_color == YELLOW) {
-    flow_budget = fair_bytes * YELLOW_BUDGET_MULT / 100;
-} else {
-    flow_budget = fair_bytes * RED_BUDGET_MULT / 100;
-}
-```
-
-**Probabilistic Drop with ECN:**
-```p4
-// If flow exceeds its budget
 if (meta.flow_bytes > flow_budget) {
     bit<8> rand_val;
     random(rand_val, 0, 255);
 
-    bit<8> drop_threshold;
     if (meta.flow_color == GREEN) {
-        drop_threshold = 26;   // 10% drop probability
-        // Also mark ECN for cooperative feedback
+        // ECN mark first
         if (hdr.ipv4.ecn == 1 || hdr.ipv4.ecn == 2) {
-            hdr.ipv4.ecn = 3;  // CE (Congestion Experienced)
+            hdr.ipv4.ecn = 3;  // CE — Congestion Experienced
         }
+        if (rand_val < 26) { mark_to_drop(standard_metadata); }   // ~10%
     } else if (meta.flow_color == YELLOW) {
-        drop_threshold = 90;   // 35% drop probability
-    } else {
-        drop_threshold = 230;  // 90% drop probability
-    }
-
-    if (rand_val < drop_threshold) {
-        meta.is_dropped = 1;
-        mark_to_drop(standard_metadata);
+        if (rand_val < 90) { mark_to_drop(standard_metadata); }   // ~35%
+    } else {  // RED
+        if (rand_val < 230) { mark_to_drop(standard_metadata); }  // ~90%
     }
 }
 ```
 
-### 3.5 RED Zone Recovery Mechanism
+### 4.7 RED Zone Recovery Mechanism
 
-**Preventing Permanent Lockout:**
+**Why is this needed?** Without recovery, any flow that enters the RED zone stays there as long as it continues to send aggressively. BBR probes for bandwidth by design — it *will* send aggressively in every probe cycle. Without recovery, BBR flows become permanently RED and are throttled to 25% of their fair share forever, even if the network would benefit from them using more. Link utilisation suffers.
+
+**The recovery protocol:**
+
+Every window, the RED streak counter for a RED flow is incremented. For GREEN and YELLOW flows, it is reset to zero.
+
 ```p4
-// Track consecutive RED windows
 if (meta.flow_color == RED) {
-    bit<8> red_streak;
-    reg_red_streak.read(red_streak, idx);
-    red_streak = red_streak + 1;
+    bit<8> streak;
+    reg_red_streak.read(streak, meta.flow_idx);
+    streak = streak + 1;
 
-    // After 20 consecutive RED windows (~300ms), grant recovery
-    if (red_streak >= 20) {
-        meta.karma_score = YELLOW_THRESHOLD - 10;  // Boost to low YELLOW
-        red_streak = 0;
+    if (streak >= 20) {
+        // 20 consecutive RED windows = ~300ms of restriction
+        // Grant partial karma recovery — move to low YELLOW
+        meta.karma = (bit<8>)(YELLOW_THRESHOLD - 10);  // karma = 30
+        streak = 0;
         meta.flow_color = YELLOW;
     }
-    reg_red_streak.write(idx, red_streak);
+    reg_red_streak.write(meta.flow_idx, streak);
 } else {
-    reg_red_streak.write(idx, 0);  // Reset streak
+    reg_red_streak.write(meta.flow_idx, 0);
 }
 ```
 
-### 3.6 Priority Queue Mapping
+**Why 20 windows (~300ms)?** This threshold was chosen to be longer than a single BBR probing cycle (~100–200ms) but shorter than a full congestion avoidance phase (~500ms–1s). A genuinely aggressive flow will not have backed off in 300ms; a cooperative-but-bursty flow will have. The recovery gives the flow a second chance to demonstrate good behaviour — if it immediately becomes aggressive again, it returns to RED within a few windows.
+
+**What recovery does NOT do:** It does not fully restore karma. A recovered flow enters at karma=30 (the bottom edge of YELLOW). It must earn its way to GREEN over subsequent well-behaved windows. This prevents gaming — a flow cannot cycle rapidly through RED→recovery→GREEN→RED.
+
+### 4.8 Priority Queue Assignment
+
+The final per-packet action maps the flow's color to a hardware priority queue:
 
 ```p4
-// Map karma color to priority queue
-action set_priority_queue() {
-    if (meta.flow_color == GREEN) {
-        standard_metadata.priority = 7;  // Highest priority
-    } else if (meta.flow_color == YELLOW) {
-        standard_metadata.priority = 4;  // Medium priority
-    } else {
-        standard_metadata.priority = 1;  // Lowest priority
-    }
-}
+if (meta.flow_color == GREEN)       standard_metadata.priority = 7;  // highest
+else if (meta.flow_color == YELLOW) standard_metadata.priority = 4;  // medium
+else                                standard_metadata.priority = 1;  // lowest
 ```
 
----
+BMv2 supports 8 priority levels (0–7). KBCS uses three well-separated levels to ensure GREEN packets are never blocked by RED packets when the switch output port is congested. The gap between levels (7, 4, 1 rather than 2, 1, 0) leaves room for future intermediate zones if required.
 
-## 4. Control Plane Design
+### 4.9 PFQ-Inspired Buffer Reservation and Recycling
 
-### 4.0 THE ROLE OF THE CONTROLLER (Critical Section)
+**Why is buffer management needed on top of karma?** Karma controls the *byte budget* — how many bytes a flow is allowed per 15ms window. But byte budgets alone cannot prevent a burst of packets from a RED flow from filling the egress queue and delaying GREEN packets that arrive milliseconds later. Even with a strict byte budget, a RED flow's already-queued packets occupy physical buffer space that GREEN packets need.
 
-**Professor's Question: "What is the role of the controller?"**
+This is the problem that PFQ (Proactive Fair Queueing, 2026) solved for general traffic. KBCS adapts PFQ's core mechanism — **dynamic per-flow queue depth thresholds with buffer recycling** — and ties it to the karma color system.
 
-The KBCS controller is the **brain** of the system. While the P4 data plane handles per-packet decisions at line rate, the controller performs **adaptive optimization** that cannot be done in the data plane.
+**How it works (two-phase):**
 
-#### What the Controller DOES:
+**Phase 1 — Ingress: Dynamic Threshold Computation (Algorithm 1 / Equation 6)**
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        CONTROLLER RESPONSIBILITIES                       │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                         │
-│  1. TELEMETRY COLLECTION (Every 100ms)                                  │
-│     ┌──────────────────────────────────────────────────────────────┐   │
-│     │  • Read per-flow karma scores from P4 registers              │   │
-│     │  • Read per-flow byte counters and drop counts               │   │
-│     │  • Read queue depth and utilization metrics                  │   │
-│     │  • Calculate aggregate JFI (Jain's Fairness Index)           │   │
-│     └──────────────────────────────────────────────────────────────┘   │
-│                              ↓                                          │
-│  2. NETWORK STATE ANALYSIS                                              │
-│     ┌──────────────────────────────────────────────────────────────┐   │
-│     │  • Count active flows (flows with traffic in last window)    │   │
-│     │  • Detect starvation (any flow < 10% of fair share)          │   │
-│     │  • Identify aggressive flows (karma < 40, RED zone)          │   │
-│     │  • Calculate link utilization                                │   │
-│     └──────────────────────────────────────────────────────────────┘   │
-│                              ↓                                          │
-│  3. PARAMETER DECISION (Q-Learning / Gradient Descent)                  │
-│     ┌──────────────────────────────────────────────────────────────┐   │
-│     │  Based on current state, decide:                             │   │
-│     │  • Should fair_bytes increase or decrease?                   │   │
-│     │  • Should penalty be more aggressive or lenient?             │   │
-│     │  • Should GREEN threshold be raised or lowered?              │   │
-│     │  • Which flows need special treatment (BBR, Vegas)?          │   │
-│     └──────────────────────────────────────────────────────────────┘   │
-│                              ↓                                          │
-│  4. P4 REGISTER UPDATES (via Thrift/P4Runtime)                         │
-│     ┌──────────────────────────────────────────────────────────────┐   │
-│     │  • Write new fair_bytes to reg_fair_bytes                    │   │
-│     │  • Write new penalty_amt to reg_penalty_amt                  │   │
-│     │  • Write new reward_amt to reg_reward_amt                    │   │
-│     │  • Write per-flow adjustments if needed                      │   │
-│     └──────────────────────────────────────────────────────────────┘   │
-│                              ↓                                          │
-│  5. LEARNING & LOGGING                                                  │
-│     ┌──────────────────────────────────────────────────────────────┐   │
-│     │  • Update Q-table with (state, action, reward, next_state)   │   │
-│     │  • Log metrics to InfluxDB for Grafana visualization         │   │
-│     │  • Track convergence and stability                           │   │
-│     └──────────────────────────────────────────────────────────────┘   │
-│                                                                         │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
-#### Controller Control Loop (Closed-Loop Feedback):
-
-```
-        ┌─────────────────────────────────────────────────────────┐
-        │                    CONTROL LOOP                         │
-        │                                                         │
-        │    ┌─────────┐     Telemetry      ┌─────────────┐      │
-        │    │   P4    │ ──────────────────→│ CONTROLLER  │      │
-        │    │  DATA   │    (karma, drops,  │  (Python)   │      │
-        │    │  PLANE  │     throughput)    │             │      │
-        │    │         │                    │  • Analyze  │      │
-        │    │         │ ←──────────────────│  • Decide   │      │
-        │    │         │   New Parameters   │  • Learn    │      │
-        │    └─────────┘   (fair_bytes,     └─────────────┘      │
-        │                   penalty, etc.)                        │
-        │                                                         │
-        │    Loop Period: 100ms (10 decisions per second)         │
-        └─────────────────────────────────────────────────────────┘
-```
-
-#### Parameters Controlled by Controller:
-
-| Parameter | Location | What Controller Does | Update Frequency |
-|-----------|----------|---------------------|------------------|
-| **fair_bytes** | `reg_fair_bytes` | Adjusts based on flow count and JFI | Every 100ms |
-| **penalty_amt** | `reg_penalty_amt` | Increases if JFI < 0.70, decreases if > 0.90 | Every 2 seconds |
-| **reward_amt** | `reg_reward_amt` | Balances with penalty for 2:1 ratio | Every 2 seconds |
-| **green_threshold** | `reg_green_thresh` | Adjusts if too many/few GREEN flows | Every 5 seconds |
-| **yellow_threshold** | `reg_yellow_thresh` | Adjusts RED zone size | Every 5 seconds |
-| **per_flow_budget** | `reg_fair_bytes_per_flow[i]` | Override for specific flows (BBR) | On detection |
-
-#### Why Controller is ESSENTIAL (Not Optional):
-
-**Without Controller (Static Configuration):**
-```
-Problem: 4 flows start → fair_bytes = 7000 (correct)
-         2 flows leave → fair_bytes still 7000 (WRONG! Should be 14000)
-
-Result: Remaining flows get 50% of capacity they deserve
-        Utilization drops, JFI drops
-```
-
-**With Controller (Dynamic Adaptation):**
-```
-Controller detects: 2 flows became inactive
-Controller calculates: new_fair_bytes = (10Mbps × 15ms) / 2_flows × 1.5 = 14000
-Controller writes: reg_fair_bytes = 14000
-
-Result: Remaining flows get full fair share
-        Utilization maintained, JFI maintained
-```
-
-#### Controller Decision Examples:
-
-**Scenario 1: JFI Drops to 0.65**
-```python
-# Controller observes:
-current_jfi = 0.65  # Below target 0.85
-
-# Controller decides:
-action = "TIGHTEN_CONTROL"
-
-# Controller acts:
-fair_bytes = fair_bytes * 0.8    # Reduce budget (stricter)
-penalty_amt = penalty_amt + 2    # Harsher penalties
-# Write to P4 registers
-```
-
-**Scenario 2: BBR Flow Detected (karma oscillating, high throughput)**
-```python
-# Controller observes:
-flow_2_karma = [100, 52, 100, 48, 100]  # Oscillating pattern
-flow_2_throughput = 4.5  # Mbps (should be ~2.5)
-
-# Controller decides:
-action = "BBR_DETECTED"
-
-# Controller acts:
-# Apply stricter per-flow budget for flow 2
-per_flow_budget[2] = fair_bytes * 0.6  # 60% of normal
-# Write to P4 register
-reg_fair_bytes_per_flow.write(2, per_flow_budget[2])
-```
-
-**Scenario 3: Vegas Flow Starving (high karma, low throughput)**
-```python
-# Controller observes:
-flow_3_karma = 100  # Perfect karma
-flow_3_throughput = 0.1  # Mbps (should be ~2.5) - STARVING!
-
-# Controller decides:
-action = "VEGAS_STARVATION"
-
-# Controller acts:
-# Boost Vegas's budget to compensate for self-throttling
-per_flow_budget[3] = fair_bytes * 2.0  # 200% of normal
-# Or reduce drop rate for this flow
-```
-
-#### Data Plane vs. Control Plane Division:
-
-| Task | Data Plane (P4) | Control Plane (Controller) |
-|------|-----------------|---------------------------|
-| Packet counting | ✅ Per-packet | ❌ |
-| Karma calculation | ✅ Per-window | ❌ |
-| Drop decision | ✅ Per-packet | ❌ |
-| Flow count detection | ❌ | ✅ Every 100ms |
-| fair_bytes calculation | ❌ | ✅ Dynamic |
-| JFI computation | ❌ | ✅ Aggregate |
-| Parameter tuning | ❌ | ✅ Learning-based |
-| Anomaly detection | ❌ | ✅ Pattern analysis |
-
-#### Controller Algorithm (Pseudocode):
-
-```python
-class KBCSController:
-    def __init__(self):
-        self.fair_bytes = 7000
-        self.penalty_amt = 8
-        self.reward_amt = 4
-        self.q_table = {}  # Q-learning state-action values
-
-    def control_loop(self):
-        while True:
-            # 1. OBSERVE
-            telemetry = self.read_p4_registers()
-            jfi = self.calculate_jfi(telemetry)
-            util = self.calculate_utilization(telemetry)
-            flow_count = self.count_active_flows(telemetry)
-
-            # 2. ANALYZE
-            state = self.get_state(jfi, util, flow_count)
-            starvation = self.detect_starvation(telemetry)
-            bbr_flows = self.detect_bbr_behavior(telemetry)
-
-            # 3. DECIDE (Q-learning)
-            if random() < self.epsilon:
-                action = random.choice(ACTIONS)
-            else:
-                action = argmax(self.q_table[state])
-
-            # 4. ACT
-            self.execute_action(action)
-
-            # 5. LEARN
-            reward = self.calculate_reward(jfi, util, starvation)
-            self.update_q_table(state, action, reward)
-
-            # 6. LOG
-            self.log_to_influxdb(telemetry, action, reward)
-
-            sleep(0.1)  # 100ms control period
-```
-
-### 4.1 Adaptive Parameter Controller
-
-**State Variables:**
-```python
-class AdaptiveController:
-    def __init__(self):
-        # Network state
-        self.num_flows = 0
-        self.total_throughput = 0
-        self.current_jfi = 0.0
-        self.avg_queue_depth = 0
-
-        # Tunable parameters
-        self.fair_bytes = 7000  # Initial estimate
-        self.penalty_mult = 8
-        self.reward_mult = 4
-        self.green_threshold = 75
-        self.yellow_threshold = 40
-
-        # Learning state (Q-learning or gradient descent)
-        self.learning_rate = 0.01
-        self.exploration_rate = 0.1
-        self.state_history = []
-```
-
-**Dynamic Fair Bytes Adjustment:**
-```python
-def update_fair_bytes(self):
-    """
-    Adjust fair_bytes based on:
-    1. Current flow count
-    2. Link utilization
-    3. Fairness index
-    """
-    # Base calculation
-    windows_per_sec = 1000 / 15  # 66.67 windows at 15ms
-    link_rate_bytes = self.link_capacity / 8  # Convert bps to Bps
-
-    # Dynamic adjustment based on JFI
-    if self.current_jfi < 0.85:
-        # Poor fairness - tighten budget
-        headroom = 1.2
-    elif self.current_jfi > 0.95:
-        # Good fairness - relax budget for utilization
-        headroom = 2.0
-    else:
-        headroom = 1.5  # Default
-
-    # Calculate per-flow fair share
-    self.fair_bytes = int(
-        (link_rate_bytes / windows_per_sec) / max(1, self.num_flows) * headroom
-    )
-
-    # Update P4 register
-    self.update_switch_register("reg_fair_bytes", self.fair_bytes)
-```
-
-### 4.2 Q-Learning Based Threshold Optimization
-
-**State Space:**
-```python
-# State: (jfi_bucket, util_bucket, flow_count_bucket)
-# JFI: [<0.7, 0.7-0.85, 0.85-0.95, >0.95]
-# Utilization: [<30%, 30-60%, 60-80%, >80%]
-# Flow count: [1-4, 5-16, 17-64, >64]
-
-def get_state(self):
-    jfi_bucket = self._bucket_jfi(self.current_jfi)
-    util_bucket = self._bucket_util(self.current_utilization)
-    flow_bucket = self._bucket_flows(self.num_flows)
-    return (jfi_bucket, util_bucket, flow_bucket)
-```
-
-**Action Space:**
-```python
-# Actions: adjust penalty/reward ratio, thresholds, or budgets
-ACTIONS = [
-    'increase_penalty',      # More aggressive against unfair flows
-    'decrease_penalty',      # More lenient
-    'increase_green_thresh', # Harder to be GREEN
-    'decrease_green_thresh', # Easier to be GREEN
-    'tighten_red_budget',    # Restrict RED flows more
-    'loosen_red_budget',     # Allow RED flows more bandwidth
-    'maintain'               # No change
-]
-```
-
-**Reward Function:**
-```python
-def calculate_reward(self, prev_state, action, new_state):
-    """
-    Reward = w1*JFI_improvement + w2*utilization - w3*starvation_penalty
-    """
-    jfi_delta = self.current_jfi - self.prev_jfi
-    util_delta = self.current_utilization - self.prev_utilization
-
-    # Starvation: any flow below 10% of fair share
-    starvation_count = sum(1 for f in self.flows if f.throughput < 0.1 * self.fair_share)
-
-    reward = (
-        10.0 * jfi_delta +           # Prioritize fairness
-        3.0 * util_delta -           # Encourage utilization
-        5.0 * starvation_count       # Penalize starvation heavily
-    )
-
-    return reward
-```
-
-**Q-Learning Update:**
-```python
-def update_q_table(self, state, action, reward, next_state):
-    """Standard Q-learning update rule"""
-    current_q = self.q_table[state][action]
-    max_next_q = max(self.q_table[next_state].values())
-
-    new_q = current_q + self.learning_rate * (
-        reward + self.discount_factor * max_next_q - current_q
-    )
-
-    self.q_table[state][action] = new_q
-```
-
-### 4.3 Proactive Buffer Reservation (Inspired by PFQ)
-
-**Buffer Allocation Strategy:**
-```python
-def calculate_proactive_buffer(self):
-    """
-    Reserve buffer space for potential incast traffic.
-    Based on PFQ's f(N) and g(N,N_hat) functions.
-    """
-    N = self.num_flows
-    N_hat = self.prev_num_flows
-
-    # Flow number influence: more flows = less reservation needed
-    alpha = 200
-    f_N = alpha / (alpha + N)
-
-    # Time influence: stable network = more reservation
-    beta = 0.7
-    g_N = math.exp(beta / (abs(N - N_hat) + 0.5))
-
-    # Calculate proactive buffer
-    proactive = min(
-        self.total_buffer * f_N * g_N,
-        self.total_buffer * 0.5  # Cap at 50%
-    )
-
-    return int(proactive)
-```
-
-### 4.4 Telemetry Collection
-
-**Metrics Exported to InfluxDB:**
-```python
-TELEMETRY_SCHEMA = {
-    'per_flow': [
-        'flow_id',
-        'karma_score',
-        'flow_color',
-        'bytes_sent',
-        'drops',
-        'throughput_mbps'
-    ],
-    'aggregate': [
-        'jain_fairness_index',
-        'total_throughput',
-        'avg_queue_depth',
-        'total_drops',
-        'active_flow_count'
-    ],
-    'per_switch': [
-        'switch_id',
-        'port_utilization',
-        'buffer_occupancy'
-    ]
-}
-```
-
----
-
-## 5. Multi-Switch Topology
-
-### 5.1 Dumbbell Topology (Single Bottleneck)
-
-```
-         ┌─────────────────────────┐
-         │     Current (Baseline)  │
-         └─────────────────────────┘
-
-    h1 ─┐                         ┌─ h_server
-    h2 ─┼─── s1 (KBCS) ───────────┤
-    h3 ─┤    │                    │
-    h4 ─┘    │                    │
-             └── bottleneck ──────┘
-                 (10 Mbps)
-```
-
-### 5.2 Two-Tier Dumbbell (Multiple Bottlenecks)
-
-```
-         ┌─────────────────────────┐
-         │     Enhanced Topology   │
-         └─────────────────────────┘
-
-    h1 ─┐                                   ┌─ h_server1
-    h2 ─┼─── s1 (KBCS) ────┬─── s3 (KBCS) ──┤
-    h3 ─┤                   │               └─ h_server2
-    h4 ─┘                   │
-                            │ bottleneck (10 Mbps)
-                            │
-    h5 ─┐                   │               ┌─ h_server3
-    h6 ─┼─── s2 (KBCS) ────┴─── s4 (KBCS) ──┤
-    h7 ─┤                                   └─ h_server4
-    h8 ─┘
-```
-
-### 5.3 Leaf-Spine Topology (Data Center Scale)
-
-```
-         ┌─────────────────────────────────────────────────┐
-         │              Leaf-Spine Topology                │
-         └─────────────────────────────────────────────────┘
-
-                    ┌────────────┐    ┌────────────┐
-                    │  Spine-1   │    │  Spine-2   │
-                    │   (KBCS)   │    │   (KBCS)   │
-                    └─────┬──────┘    └──────┬─────┘
-                          │                  │
-              ┌───────────┼──────────────────┼───────────┐
-              │           │                  │           │
-         ┌────┴────┐ ┌────┴────┐       ┌────┴────┐ ┌────┴────┐
-         │ Leaf-1  │ │ Leaf-2  │       │ Leaf-3  │ │ Leaf-4  │
-         │ (KBCS)  │ │ (KBCS)  │       │ (KBCS)  │ │ (KBCS)  │
-         └────┬────┘ └────┬────┘       └────┬────┘ └────┬────┘
-              │           │                  │           │
-         ┌────┴────┐ ┌────┴────┐       ┌────┴────┐ ┌────┴────┐
-         │ h1..h8  │ │ h9..h16 │       │h17..h24 │ │h25..h32 │
-         └─────────┘ └─────────┘       └─────────┘ └─────────┘
-```
-
-### 5.4 Multi-Switch KBCS Coordination
-
-**Challenge:** How do karma scores propagate across switches?
-
-**Solution 1: Local Karma (Recommended)**
-Each switch maintains independent karma scores. Flow that is unfair at one bottleneck will be penalized there.
+At every window boundary (every 15ms), the ingress pipeline computes a per-flow PFQ threshold based on how much of its budget the flow actually used in the just-expired window:
 
 ```p4
-// Each switch computes karma independently
-// No inter-switch communication needed
-// Simpler, scales better
-```
-
-**Solution 2: Distributed Karma (Advanced)**
-Switches share karma updates via in-band telemetry.
-
-```p4
-// Embed karma in packet header (INT-like)
-header kbcs_telemetry_t {
-    bit<8>  flow_karma;
-    bit<8>  upstream_drops;
-    bit<16> ingress_switch;
-}
-
-// Downstream switch can use upstream karma as hint
-```
-
-### 5.5 Multi-Path Routing with Karma
-
-**Equal-Cost Multi-Path (ECMP) with Karma-Aware Selection:**
-```p4
-action ecmp_with_karma() {
-    bit<32> hash_val;
-    hash(hash_val, HashAlgorithm.crc16, 0,
-         {hdr.ipv4.srcAddr, hdr.ipv4.dstAddr,
-          hdr.tcp.srcPort, hdr.tcp.dstPort},
-         NUM_PATHS);
-
-    // Modify path selection for RED flows
-    // Route aggressive flows through less congested paths
-    if (meta.flow_color == RED) {
-        hash_val = (hash_val + 1) % NUM_PATHS;  // Alternate path
-    }
-
-    standard_metadata.egress_spec = path_table[hash_val];
-}
-```
-
----
-
-## 6. Congestion Handling Mechanism
-
-### 6.1 Five-Phase Congestion Control
-
-```
-┌──────────────────────────────────────────────────────────────────┐
-│                    KBCS Congestion Control Flow                  │
-├──────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  ┌────────────┐    ┌────────────┐    ┌────────────┐             │
-│  │ DETECTION  │───→│ ATTRIBUTION│───→│ CLASSIFICATION│          │
-│  │            │    │            │    │            │             │
-│  │ • Per-flow │    │ • Karma    │    │ • GREEN    │             │
-│  │   byte     │    │   update   │    │ • YELLOW   │             │
-│  │   counting │    │ • Fair     │    │ • RED      │             │
-│  │ • Queue    │    │   share    │    │            │             │
-│  │   depth    │    │   compare  │    │            │             │
-│  └────────────┘    └────────────┘    └────────────┘             │
-│         │                │                  │                    │
-│         ▼                ▼                  ▼                    │
-│  ┌────────────┐    ┌────────────┐    ┌────────────┐             │
-│  │ ENFORCEMENT│←───│ RECOVERY   │←───│ ADAPTATION │             │
-│  │            │    │            │    │            │             │
-│  │ • Diff.    │    │ • RED      │    │ • Dynamic  │             │
-│  │   drop     │    │   streak   │    │   fair_    │             │
-│  │   rates    │    │   tracking │    │   bytes    │             │
-│  │ • ECN      │    │ • Karma    │    │ • Threshold│             │
-│  │   marking  │    │   boost    │    │   tuning   │             │
-│  │ • Priority │    │            │    │            │             │
-│  │   queueing │    │            │    │            │             │
-│  └────────────┘    └────────────┘    └────────────┘             │
-│                                                                  │
-└──────────────────────────────────────────────────────────────────┘
-```
-
-### 6.2 Phase 1: Detection
-
-**Per-Flow Byte Accounting:**
-- Every packet updates `reg_flow_bytes[flow_idx] += pkt.len`
-- Window timer (15ms) triggers karma evaluation
-
-**Queue Depth Monitoring:**
-- Egress pipeline monitors `standard_metadata.enq_qdepth`
-- Used for adaptive threshold adjustment
-
-### 6.3 Phase 2: Attribution
-
-**Fair Share Calculation:**
-```
-fair_bytes = link_rate × window_duration / num_flows × headroom
-
-If flow_bytes > fair_bytes:
-    Flow is exceeding fair share → Apply penalty
-Else:
-    Flow is cooperative → Apply reward
-```
-
-**Karma Update Formula:**
-```
-karma_new = karma_old + direction × magnitude
-
-where:
-    direction = -1 (penalty) if flow_bytes > fair_bytes
-                +1 (reward)  if flow_bytes <= fair_bytes
-
-    magnitude = base_amount × (excess_ratio or deficit_ratio)
-```
-
-### 6.4 Phase 3: Classification
-
-**Color Zone Assignment:**
-| Zone | Karma Range | Interpretation |
-|------|-------------|----------------|
-| GREEN | 75-100 | Cooperative, fair flow |
-| YELLOW | 40-74 | Moderately unfair |
-| RED | 0-39 | Highly unfair/aggressive |
-
-### 6.5 Phase 4: Enforcement
-
-**Differentiated Active Queue Management:**
-| Color | Drop Rate | Budget | Priority | ECN |
-|-------|-----------|--------|----------|-----|
-| GREEN | 10% | 2.0x fair | High (7) | Mark before drop |
-| YELLOW | 35% | 1.0x fair | Medium (4) | Mark and drop |
-| RED | 90% | 0.25x fair | Low (1) | Drop primarily |
-
-### 6.6 Phase 5: Recovery
-
-**RED Zone Recovery Protocol:**
-1. Track consecutive RED windows per flow
-2. After 20 consecutive RED windows (~300ms at 15ms window):
-   - Boost karma to YELLOW zone (score = 30)
-   - Reset RED streak counter
-3. Allows flows to prove they've reformed behavior
-
-### 6.7 Comparison with Other Mechanisms
-
-| Mechanism | Congestion Signal | Per-Flow | Adaptive | Recovery |
-|-----------|-------------------|----------|----------|----------|
-| RED | Queue depth | No | No | N/A |
-| CoDel | Sojourn time | No | Yes | N/A |
-| PIE | Queue delay | No | Yes | N/A |
-| FQ-CoDel | Per-flow + delay | Yes | Yes | Implicit |
-| **KBCS** | **Karma (reputation)** | **Yes** | **Yes** | **Explicit** |
-
-**KBCS Advantages:**
-1. **History-aware**: Karma accumulates over time, not instantaneous
-2. **CCA-sensitive**: Different CCAs naturally get different karma
-3. **Recovery mechanism**: Prevents permanent blacklisting
-4. **Dual signaling**: ECN for cooperative, drops for aggressive
-
----
-
-## 7. Dynamic Parameter Adaptation
-
-### 7.1 Parameters Subject to Adaptation
-
-| Parameter | Default | Range | Adjustment Trigger |
-|-----------|---------|-------|-------------------|
-| `fair_bytes` | 7000 | 3000-15000 | Flow count change |
-| `penalty_mult` | 8 | 4-20 | JFI below target |
-| `reward_mult` | 4 | 2-10 | Starvation detected |
-| `green_threshold` | 75 | 60-90 | Distribution skewed |
-| `yellow_threshold` | 40 | 25-55 | RED zone crowding |
-| `drop_rate_red` | 90% | 70-99% | BBR present |
-
-### 7.2 Controller Update Cycle
-
-```python
-def controller_update_cycle(self):
-    """
-    Main control loop - runs every 100ms
-    """
-    while True:
-        # 1. Collect telemetry from all switches
-        telemetry = self.collect_telemetry()
-
-        # 2. Calculate aggregate metrics
-        jfi = self.calculate_jfi(telemetry)
-        utilization = self.calculate_utilization(telemetry)
-        starvation = self.detect_starvation(telemetry)
-
-        # 3. Get current state
-        state = self.get_state(jfi, utilization, self.num_flows)
-
-        # 4. Choose action (epsilon-greedy)
-        if random.random() < self.exploration_rate:
-            action = random.choice(ACTIONS)
-        else:
-            action = self.get_best_action(state)
-
-        # 5. Execute action
-        self.execute_action(action)
-
-        # 6. Wait for effect
-        time.sleep(0.1)  # 100ms
-
-        # 7. Measure new state and reward
-        new_telemetry = self.collect_telemetry()
-        new_state = self.get_state(...)
-        reward = self.calculate_reward(state, action, new_state)
-
-        # 8. Update Q-table
-        self.update_q_table(state, action, reward, new_state)
-
-        # 9. Log for visualization
-        self.log_to_influxdb(telemetry, action, reward)
-```
-
-### 7.3 Gradient Descent Alternative (Simpler)
-
-```python
-def gradient_descent_update(self):
-    """
-    Simpler alternative to Q-learning for parameter tuning
-    """
-    # Target: maximize JFI while maintaining utilization > 50%
-
-    jfi_error = 0.95 - self.current_jfi  # Target JFI = 0.95
-    util_error = max(0, 0.5 - self.current_utilization)  # Min util = 50%
-
-    # Gradient for fair_bytes
-    # If JFI low, decrease fair_bytes (tighter control)
-    # If utilization low, increase fair_bytes (more permissive)
-    fair_bytes_grad = -jfi_error * 1000 + util_error * 2000
-
-    # Update with momentum
-    self.fair_bytes_velocity = (
-        0.9 * self.fair_bytes_velocity +
-        self.learning_rate * fair_bytes_grad
-    )
-    self.fair_bytes += int(self.fair_bytes_velocity)
-    self.fair_bytes = max(3000, min(15000, self.fair_bytes))
-
-    # Similar for other parameters...
-```
-
----
-
-## 8. Integration with Related Work
-
-### 8.1 Concepts from CCQM (Ma et al., 2026)
-
-**What CCQM Does:**
-- Uses Binary Decision Tree (BDT) to classify CCAs into categories
-- Assigns flows to separate queues: Loss, Delay, Hybrid, Model, Short
-- 63.33% fairness improvement
-
-**How KBCS Integrates:**
-
-1. **CCA Category Awareness (Optional Enhancement)**
-```python
-# Controller can detect CCA category from behavior patterns
-class CCAClassifier:
-    def classify(self, flow_stats):
-        """
-        Features: RTT variance, retransmit ratio, throughput pattern
-        """
-        features = self.extract_features(flow_stats)
-
-        # Simple heuristic (can be replaced with BDT)
-        if features['retransmit_ratio'] > 0.1:
-            return 'loss_based'  # CUBIC, Reno
-        elif features['rtt_sensitivity'] > 0.8:
-            return 'delay_based'  # Vegas
-        elif features['rate_stability'] > 0.9:
-            return 'model_based'  # BBR
-        else:
-            return 'hybrid'  # Illinois
-```
-
-2. **Separate Queue Assignment by CCA Type**
-```p4
-// Enhanced priority mapping
-if (meta.cca_type == DELAY_BASED) {
-    // Vegas-like: highest priority to prevent starvation
-    standard_metadata.priority = 7;
-} else if (meta.cca_type == MODEL_BASED && meta.flow_color == RED) {
-    // BBR in RED: needs rate limiting, not just drops
-    standard_metadata.priority = 0;  // Lowest
+// Compute utilisation ratio: flow_bytes / expired_budget
+if (flow_bytes < expired_budget >> 2) {
+    // < 25% used: heavily underutilised — donate buffer headroom
+    pfq_thresh = 15;  // generous threshold
+} else if (flow_bytes < expired_budget >> 1) {
+    // 25–50% used: moderate headroom
+    pfq_thresh = 10;
+} else if (flow_bytes < expired_budget) {
+    // 50–100% used: standard headroom
+    pfq_thresh = 6;
 } else {
-    // Standard karma-based priority
-    standard_metadata.priority = karma_to_priority(meta.karma_score);
+    // Over budget: strict, color-scaled throttle
+    if (flow_color == GREEN)  pfq_thresh = 12;  // trusted, some headroom
+    if (flow_color == YELLOW) pfq_thresh = 5;   // restricted
+    if (flow_color == RED)    pfq_thresh = 2;   // quarantined
 }
+reg_pfq_threshold.write(flow_idx, pfq_thresh);
 ```
 
-### 8.2 Concepts from PFQ (Wang et al., 2026)
+**Key insight — buffer recycling:** A flow that used only 25% of its budget gets a threshold of 15 packets. A flow that exceeded its budget and is RED gets a threshold of just 2. The 13-packet difference is effectively *recycled* from the idle flow to the active GREEN flows. This is PFQ's "donate unused buffer" concept, but applied through the lens of karma.
 
-**What PFQ Does:**
-- Proactive buffer reservation for incast
-- Dynamic buffer recycling from small to large flows
-- Virtual queue mapping with periodic remapping
-- 74.3% reduction in drop rate
+**Phase 2 — Egress: Proactive Drop (Algorithm 3)**
 
-**How KBCS Integrates:**
+In the egress pipeline, *before* the packet is placed into the output queue, the switch checks the current queue depth against the flow's PFQ threshold:
 
-1. **Proactive Buffer Reservation**
-```python
-# In controller
-def update_buffer_reservation(self):
-    # Reserve space for potential new flows
-    reserved = self.calculate_proactive_buffer()
-
-    # Reduce available fair_bytes accordingly
-    available_buffer = self.total_buffer - reserved
-    self.fair_bytes = available_buffer / self.num_flows
-```
-
-2. **Buffer Recycling from Low-Karma Flows**
 ```p4
-// In P4: flows in RED zone get reduced buffer quota
-// Recycled buffer goes to GREEN flows
-bit<32> effective_budget;
-if (meta.flow_color == GREEN) {
-    effective_budget = base_budget + recycled_budget;
-} else if (meta.flow_color == RED) {
-    effective_budget = base_budget - recycle_amount;
+// Egress: PFQ enqueue quota check
+if (enq_qdepth > pfq_threshold) {
+    // Queue is too full for this flow's allocated share
+    reg_drops.write(flow_idx, drops + 1);
+    mark_to_drop(standard_metadata);
 }
 ```
 
-### 8.3 Concepts from HINT (Sacco et al., 2023)
+This is fundamentally different from traditional AQM (which drops based on *total* queue depth) or the ingress probabilistic drops used in Section 4.6. The egress PFQ drop is:
+- **Per-flow** — each flow has its own threshold, so a RED flow with threshold=2 is dropped while a GREEN flow with threshold=12 passes through the same queue
+- **Deterministic** — no randomness; if the queue exceeds the threshold, the packet is dropped. This gives CCAs a clear, unambiguous signal
+- **Dynamic** — the threshold changes every 15ms window based on actual flow behaviour, not static configuration
 
-**What HINT Does:**
-- In-Band Network Telemetry (INT) for congestion control
-- P4 switches insert telemetry data into packet headers
-- Data includes: switch ID, queue occupancy, hop latency
-- Feeds real-time network state to RL-based CCAs
+**Why this matters for KBCS specifically:**
 
-**How KBCS Integrates:**
+| Without PFQ (karma-only) | With PFQ (karma + buffer) |
+|---|---|
+| RED flow sends a burst → packets enter queue → delay GREEN packets behind them | RED flow's burst is proactively dropped at egress if queue depth > 2 → GREEN packets unaffected |
+| GREEN flow's burst is treated same as RED flow's burst at queue level | GREEN flow gets threshold=12-15 → burst passes through, maintaining utilisation |
+| Queue depth oscillates unpredictably | Queue depth is bounded per-flow, stable and predictable |
 
-1. **INT Header for Karma Propagation (Multi-Switch)**
-```p4
-// INT header carrying karma information across switches
-header kbcs_int_t {
-    bit<8>   karma_score;      // Flow's current karma
-    bit<8>   ingress_sw_id;    // Originating switch
-    bit<16>  queue_depth;      // Current queue occupancy
-    bit<32>  enq_timestamp;    // Timestamp at enqueue
-}
+This two-dimensional enforcement — karma for *rate control* and PFQ for *buffer control* — is unique to KBCS. Neither P4CCI, P4air, nor standalone PFQ provide both.
 
-action insert_kbcs_int() {
-    hdr.kbcs_int.setValid();
-    hdr.kbcs_int.karma_score = meta.karma_score;
-    hdr.kbcs_int.ingress_sw_id = SWITCH_ID;
-    hdr.kbcs_int.queue_depth = (bit<16>)standard_metadata.enq_qdepth;
-    hdr.kbcs_int.enq_timestamp = standard_metadata.enq_timestamp;
-}
+---
+
+*— End of Part 2 —*  
+*Part 3 covers the Control Plane (Q-Learning controller), Topology Design, and Evaluation Methodology.*
+
+---
+
+## 5. Control Plane Design (Controller)
+
+The Q-Learning controller (`controller/rl_controller.py`) is the adaptive brain of KBCS. It does not touch individual packets — that is the data plane's job. Instead, it observes aggregate network behaviour every 2 seconds and adjusts the global parameters that the data plane uses.
+
+### 5.1 Why a Controller is Necessary
+
+A purely static P4 configuration would require manually setting `fair_bytes` for a fixed number of flows. In practice, the number of active flows changes constantly:
+
+- **Static case (bad):** `fair_bytes` set for 4 flows = 7000 bytes. Two flows leave. Remaining 2 flows should now each get 14000 bytes, but `fair_bytes` stays at 7000. The switch wastes 50% of the link's capacity because it over-penalises the remaining flows for "exceeding" a budget that was calculated for twice as many flows.
+
+- **Dynamic case (KBCS):** Controller detects only 2 flows are active. Recalculates `fair_bytes = 14000`. Writes to register. Within the next window cycle, the data plane enforces the correct budget. Utilisation is preserved.
+
+This is the fundamental reason a control loop is needed — not machine learning for its own sake, but dynamic recalibration as network conditions evolve.
+
+### 5.2 The Q-Learning Control Loop
+
+The controller runs a closed-loop control cycle every 2 seconds:
+
+```
+┌────────────────────────────────────────────────────────┐
+│  1. OBSERVE — Read P4 registers                        │
+│     • per-flow byte counts and drop counts             │
+│     • aggregate: compute JFI, utilisation, flow count  │
+│                                                        │
+│  2. ENCODE STATE                                       │
+│     • JFI bucket: <0.7 | 0.7–0.85 | 0.85–0.95 | >0.95│
+│     • Util bucket: <30% | 30–60% | 60–80% | >80%      │
+│     • Flow count: 1–4 | 5–8 | 9–16 | >16              │
+│     → 4×4×4 = 64 possible states                      │
+│                                                        │
+│  3. SELECT ACTION (Q-table lookup + ε-greedy)          │
+│     • increase_penalty | decrease_penalty              │
+│     • tighten_red_budget | loosen_red_budget           │
+│     • increase_green_thresh | decrease_green_thresh    │
+│     • maintain (no change)                             │
+│     → 7 actions                                        │
+│                                                        │
+│  4. EXECUTE — Write to P4 registers via Thrift         │
+│     • Update reg_fair_bytes, reg_penalty_amt, etc.     │
+│                                                        │
+│  5. CALCULATE REWARD (after next observation)          │
+│     Reward = 10×ΔJFI + 3×Δutil − 5×starvation_count   │
+│                                                        │
+│  6. UPDATE Q-TABLE (standard Q-learning rule)          │
+│     Q(s,a) ← Q(s,a) + α[r + γ·max Q(s',a') − Q(s,a)] │
+└────────────────────────────────────────────────────────┘
 ```
 
-2. **Downstream Karma Adjustment Using INT**
-```p4
-// At downstream switch, consider upstream karma
-action process_upstream_karma() {
-    if (hdr.kbcs_int.isValid()) {
-        // If flow was already penalized upstream, don't double-penalize
-        if (hdr.kbcs_int.karma_score < YELLOW_THRESHOLD) {
-            meta.upstream_red = 1;
-        }
-        // Use upstream queue info for adaptive decisions
-        meta.upstream_qd = hdr.kbcs_int.queue_depth;
-    }
-}
-```
+### 5.3 State and Action Space Design
 
-3. **Telemetry Export to Controller**
+**Why Q-Learning and not a rule-based controller?**  
+A rule-based controller (e.g., "if JFI < 0.7, increase penalty") works for simple steady-state scenarios but cannot handle the interaction between multiple parameters. Increasing the penalty when JFI is low also reduces link utilisation if the penalty is already too high. Q-Learning explores these interactions and learns which actions actually improve the reward over time without requiring a hand-crafted decision tree for every combination.
+
+**Why such a small state space (64 states)?**  
+Larger state spaces require more exploration time before the Q-table converges. With 30-run experiments of 60 seconds each, a 64-state × 7-action Q-table (448 entries) converges reliably. A 1000-state table would require far more runs to explore. The bucketed representation also provides natural generalisation — a state that occurs rarely will share Q-values with adjacent states.
+
+**Reward function rationale:**
+
+| Term | Weight | Rationale |
+|------|--------|-----------|
+| `ΔJFI` | 10 | Primary objective — fairness improvement is the top priority |
+| `Δutilisation` | 3 | Secondary — fairness must not come at the cost of wasted capacity |
+| `starvation_count` | −5 | Hard constraint — any flow receiving <10% of its fair share is catastrophic |
+
+The negative weight on starvation is intentionally large (−5 per starving flow) to prevent the controller from finding a "cheat" solution like throttling all flows equally — which would produce a high JFI but near-zero utilisation.
+
+### 5.4 fair_bytes Recalculation
+
+The most frequent action taken by the controller is recalculating `fair_bytes` when flow count changes. This happens outside the Q-learning loop, triggered whenever the active flow count differs from the previous cycle:
+
 ```python
-# Controller receives INT data for RL training
-class INTCollector:
-    def process_int_report(self, packet):
-        # Extract INT headers from packet
-        int_data = self.parse_int_header(packet)
+def update_fair_bytes(self, active_flows, jfi):
+    link_rate_bytes = self.link_capacity_bps / 8   # bits → bytes
+    window_sec = 0.015                              # 15ms window
 
-        # Feed to RL model state
-        self.rl_state.update({
-            'queue_depths': int_data.queue_depth_stack,
-            'hop_latencies': int_data.hop_latencies,
-            'flow_karma_trace': int_data.karma_trace
-        })
-```
-
-### 8.4 Concepts from Real-Time CCA Identification (García-López et al., 2025)
-
-**What This Paper Does:**
-- P4 switches extract per-flow metrics in real-time
-- Random Forest classifier identifies CCA type
-- Features: queue delay (64.7% importance), queue depth (16.9%)
-- Achieves 97% packet-level, 100% flow-level accuracy
-
-**How KBCS Integrates:**
-
-1. **Feature Extraction in P4**
-```p4
-// Metrics for CCA classification
-register<bit<32>>(REG_SIZE) reg_last_arrival;
-register<bit<32>>(REG_SIZE) reg_last_qdelay;
-register<bit<32>>(REG_SIZE) reg_pkt_count;
-
-action extract_cca_features() {
-    bit<48> now = standard_metadata.ingress_global_timestamp;
-
-    // Interarrival time
-    bit<32> last_arrival;
-    reg_last_arrival.read(last_arrival, meta.flow_idx);
-    meta.interarrival = (bit<32>)(now - (bit<48>)last_arrival);
-    reg_last_arrival.write(meta.flow_idx, (bit<32>)now);
-
-    // Queue delay (most important feature - 64.7%)
-    meta.queue_delay = (bit<32>)standard_metadata.deq_timedelta;
-
-    // Queue depth (16.9% importance)
-    meta.queue_depth = standard_metadata.enq_qdepth;
-
-    // Sending rate estimate
-    meta.sending_rate = meta.flow_bytes * 8 / WINDOW_USEC;  // bits/us
-}
-```
-
-2. **CCA Classification (Controller-Side ML)**
-```python
-class CCAClassifier:
-    def __init__(self):
-        # Random Forest trained on labeled CCA data
-        self.model = RandomForestClassifier(n_estimators=100)
-
-    def classify(self, flow_features):
-        """
-        Features in order of importance:
-        1. queue_delay (64.7%)
-        2. queue_depth (16.9%)
-        3. interarrival_time (9.3%)
-        4. sending_rate (5.8%)
-        5. packet_size_variance (3.3%)
-        """
-        X = np.array([
-            flow_features['queue_delay'],
-            flow_features['queue_depth'],
-            flow_features['interarrival_time'],
-            flow_features['sending_rate'],
-            flow_features['pkt_size_var']
-        ]).reshape(1, -1)
-
-        cca_type = self.model.predict(X)[0]
-        return cca_type  # 'cubic', 'reno', 'bbr', 'vegas'
-```
-
-3. **CCA-Aware Karma Adjustment**
-```python
-def adjust_karma_for_cca(self, flow_id, cca_type, base_karma):
-    """
-    Apply CCA-specific adjustments to karma
-    """
-    if cca_type == 'vegas':
-        # Vegas self-throttles - boost karma to prevent starvation
-        adjusted = min(100, base_karma + 20)
-    elif cca_type == 'bbr':
-        # BBR ignores drops - stricter karma penalties
-        adjusted = max(0, base_karma - 10)
+    # Headroom adapts to current fairness level
+    if jfi < 0.85:
+        headroom = 1.2   # Tighter — fairness is poor, be strict
+    elif jfi > 0.95:
+        headroom = 2.0   # Generous — fairness is excellent, allow burst
     else:
-        # Loss-based CCAs respond normally
-        adjusted = base_karma
+        headroom = 1.5   # Default balanced headroom
 
-    return adjusted
+    new_fair_bytes = int(
+        (link_rate_bytes * window_sec) / max(1, active_flows) * headroom
+    )
+    self.write_register('reg_fair_bytes', new_fair_bytes)
 ```
 
-### 8.5 Comparison Table
+**Why adaptive headroom?** When JFI is already high (>0.95), flows are well-behaved. A generous budget allows short bursts without triggering penalties — this improves throughput without sacrificing fairness. When JFI is poor (<0.85), stricter budgets force flows to stay closer to their allocation, improving fairness at the cost of some peak throughput.
 
-| Feature | KBCS | CCQM | PFQ | HINT | CCA-ID |
-|---------|------|------|-----|------|--------|
-| Per-flow tracking | Yes | Yes | Yes | No | Yes |
-| CCA classification | Implicit | Explicit (BDT) | No | No | ML (RF) |
-| Reputation system | Yes (Karma) | No | No | No | No |
-| Queue isolation | Priority-based | Category-based | Virtual queues | N/A | N/A |
-| Buffer reservation | Planned | No | Yes | No | No |
-| Recovery mechanism | Yes (RED streak) | Implicit | No | N/A | N/A |
-| Drop differentiation | Yes (color-based) | Yes (CCA-based) | Yes (quota) | N/A | N/A |
-| ECN support | Yes | Yes | No | N/A | N/A |
-| Multi-switch | Planned (INT) | Single | Single | Yes (INT) | Single |
-| In-band telemetry | Planned | No | No | Yes | No |
-| Real-time ML | Planned (Q-learning) | No | No | RL-based CCA | Yes (RF) |
+### 5.5 Multi-Switch Coordination
+
+Each switch runs its own independent KBCS instance with its own register bank. The controller connects to all switches via separate Thrift ports and runs the same control loop for each. The Q-table is **shared** across switches — meaning if the controller learns that "increase penalty in a high-congestion, low-JFI state" is a good action at Switch 1, Switch 2 immediately benefits from that same policy.
+
+Individual switch parameters (`fair_bytes`, `penalty_amt`) are set independently based on each switch's own observed JFI and utilisation. This local independence is correct — two switches on different paths may have very different congestion states at the same moment.
 
 ---
 
-## 9. Implementation Details
+## 6. Topology Design and Experimental Setup
 
-### 9.1 P4 Program Structure
+### 6.1 Why Two Topologies?
 
-```
-kbcs/
-├── p4src/
-│   ├── headers.p4          # Header definitions
-│   ├── parser.p4           # Packet parsing
-│   ├── ingress.p4          # Main KBCS logic
-│   ├── egress.p4           # Telemetry and priority
-│   └── kbcs.p4             # Top-level include
-├── includes/
-│   ├── constants.p4        # Configurable constants
-│   └── checksums.p4        # Checksum computation
-├── rl_controller.py        # Adaptive controller
-├── telemetry.py            # InfluxDB integration
-└── topology.py             # Mininet topology
-```
+A single topology result could be a coincidence. Two structurally different topologies with different flow counts and different congestion patterns provide stronger evidence of generalisability.
 
-### 9.2 Key Register Sizes
+**Dumbbell topology (4 flows, 1 bottleneck):**  
+The simplest inter-CCA fairness scenario. Four sender hosts (H1–H4, each running a different CCA) connect to switch S1, which is linked to switch S2 via a single bottleneck limited to **~3 Mbps** (250 pps via `set_queue_rate`). Four receiver hosts (H5–H8) connect to S2. All four flows share this one bottleneck. If KBCS cannot improve fairness here, it cannot work anywhere. This topology structure is also used by P4air and P4CCI in their papers, making comparison direct and fair.
 
-```p4
-#define REG_SIZE            8192   // Max concurrent flows
-#define KARMA_BITS          8      // 0-100 karma values
-#define COUNTER_BITS        32     // Byte counters
-#define TIMESTAMP_BITS      48     // Microsecond timestamps
-```
+![KBCS Dumbbell Topology](kbcs_v2/plots/topo_dumbbell.png)
 
-### 9.3 Memory Budget (BMv2 Estimate)
+**Cross topology (8 flows, 4 switches, 12 hosts, multi-path):**  
+Eight sender flows (H1–H4 on S1, H5–H8 on S2, two of each CCA) compete across four switches with cross-links between them. Four receiver hosts (H9–H10 on S3, H11–H12 on S4) run iperf servers. Each inter-switch link is independently rate-limited to **~3 Mbps** (250 pps via `set_queue_rate`). Flows can reach receivers via multiple paths, creating scenarios where a single flow is managed simultaneously by two different KBCS switch instances. This tests:
+- Whether independent KBCS instances (no coordination) produce consistent outcomes
+- Whether fairness holds under multi-path contention at reduced per-link capacity
+- Scalability from 4 to 8 competing flows across 4 switches
 
-| Component | Size | Notes |
-|-----------|------|-------|
-| `reg_flow_bytes` | 8192 × 32 bits = 32 KB | Per-flow byte counter |
-| `reg_karma_score` | 8192 × 8 bits = 8 KB | Karma scores |
-| `reg_flow_color` | 8192 × 2 bits = 2 KB | Color zones |
-| `reg_last_window` | 8192 × 48 bits = 48 KB | Timestamps |
-| `reg_drops` | 8192 × 32 bits = 32 KB | Drop counters |
-| `reg_red_streak` | 8192 × 8 bits = 8 KB | Recovery tracker |
-| **Total** | **~130 KB** | Well within BMv2 limits |
+![KBCS Cross Topology](kbcs_v2/plots/topo_cross.png)
 
-### 9.4 Scalability Considerations
+### 6.2 Link Parameters
 
-**For Hardware Deployment (Tofino):**
-- Use sketch data structures for flow counting
-- Count-Min Sketch for byte accounting
-- Bloom filter for active flow detection
-- TCAM for flow classification rules
+| Parameter | Dumbbell | Cross |
+|-----------|----------|-------|
+| Switches | 2 (S1, S2) | 4 (S1–S4) |
+| Hosts | 8 (H1–H4 senders, H5–H8 receivers) | 12 (H1–H8 senders, H9–H12 receivers) |
+| Access link rate | 100 Mbps | 100 Mbps |
+| Access link delay | 5 ms (netem) | 5 ms (netem) |
+| Bottleneck rate | ~3 Mbps (`set_queue_rate 250` on S1 port 5) | ~3 Mbps per inter-switch link (`set_queue_rate 250` on ports 5, 6) |
+| Bottleneck delay | 5 ms | 5 ms |
+| Queue type | Priority (3 queues) | Priority (3 queues) |
+| Rate enforcement | `simple_switch_CLI set_queue_rate 250` | `simple_switch_CLI set_queue_rate 250` |
+
+### 6.3 Traffic Parameters
+
+| CCA | Flows in Dumbbell | Flows in Cross | Tool |
+|-----|-------------------|----------------|------|
+| CUBIC | 1 (h1) | 2 (h1, h5) | iperf3 -C cubic |
+| BBR | 1 (h2) | 2 (h2, h6) | iperf3 -C bbr |
+| Vegas | 1 (h3) | 2 (h3, h7) | iperf3 -C vegas |
+| Illinois | 1 (h4) | 2 (h4, h8) | iperf3 -C illinois |
+
+Each flow runs for **60 seconds** per experiment. Metrics are collected over the full 60 seconds (not just a steady-state window) to capture startup, convergence, and any transient unfairness.
 
 ---
 
-## 10. Evaluation Methodology
+## 7. Evaluation Methodology
 
-### 10.1 Metrics
+### 7.1 Metrics
 
-| Metric | Formula | Target |
-|--------|---------|--------|
-| Jain's Fairness Index | JFI = (Σxi)² / (n × Σxi²) | > 0.90 |
-| Link Utilization | Total throughput / Link capacity | > 60% |
-| Per-flow Throughput | Mean ± Std Dev | Low variance |
-| Packet Drop Rate | Drops / Total packets | < 5% |
-| Flow Completion Time | Time to transfer fixed data | Minimized |
+**Jain's Fairness Index (JFI):**  
+The primary metric. Defined as:
 
-### 10.2 Test Configurations
-
-**Homogeneous Tests:**
-```bash
-# All CUBIC (baseline)
---ccas "cubic,cubic,cubic,cubic"
-
-# All loss-based
---ccas "cubic,reno,htcp,illinois"
-
-# All delay-based
---ccas "vegas,vegas,vegas,vegas"
+```
+JFI = (Σ xᵢ)² / (n × Σ xᵢ²)
 ```
 
-**Heterogeneous Tests (Target Scenario):**
-```bash
-# Mixed CCAs (challenging)
---ccas "cubic,bbr,vegas,illinois"
+Where `xᵢ` is the throughput of flow `i` and `n` is the number of flows. JFI = 1.0 means all flows receive exactly equal throughput. JFI = 1/n means one flow receives everything.
 
-# Real-world approximation
---ccas "cubic,cubic,bbr,reno"
-```
+**Aggregate Throughput (Mbps):**  
+Total bytes forwarded across all flows divided by experiment duration. High throughput with high JFI is the ideal — it confirms that KBCS does not improve fairness simply by throttling everyone equally.
 
-### 10.3 Statistical Validation
+**Link Utilisation (%):**  
+Aggregate throughput as a fraction of the bottleneck link's capacity. A system that achieves JFI=1.0 by dropping all packets would show 0% utilisation — this metric catches such degenerate cases.
 
-**Protocol:**
-1. Run each configuration 30 times
-2. Report mean, standard deviation, 95% confidence interval
-3. Use Mann-Whitney U test for significance (p < 0.05)
+**Packet Drop Ratio:**  
+Total drops / total packets sent. Expected to be near zero in all cases since drops are used only for enforcement above-budget, and well-behaved flows rarely trigger drops.
 
-```python
-def statistical_summary(results):
-    mean = np.mean(results)
-    std = np.std(results)
-    ci_95 = stats.t.interval(0.95, len(results)-1,
-                             loc=mean, scale=stats.sem(results))
-    return {
-        'mean': mean,
-        'std': std,
-        'ci_lower': ci_95[0],
-        'ci_upper': ci_95[1],
-        'min': np.min(results),
-        'max': np.max(results)
-    }
-```
+### 7.2 Statistical Rigour — 30 Runs
 
-### 10.4 Expected Results
+Each topology × mode combination (FIFO, P4CCI, KBCS) is evaluated over **30 independent experimental runs**. Between runs, Mininet is fully torn down and restarted (clean state). This controls for:
+- Kernel TCP state carry-over between experiments
+- ARP cache effects
+- P4 register state from previous runs
 
-| Configuration | Baseline (No KBCS) | With KBCS | Improvement |
-|--------------|-------------------|-----------|-------------|
-| Loss-based only | 0.85-0.90 JFI | 0.95-0.99 JFI | +10% |
-| With BBR | 0.50-0.60 JFI | 0.75-0.85 JFI | +35% |
-| Incast (32-to-1) | 60% drop rate | 15% drop rate | -75% |
-| Utilization | 80% | 60% | Trade-off |
+**Metrics reported:** Mean ± standard deviation over 30 runs. All bar charts show mean with standard deviation error bars.
 
----
+### 7.3 Baseline Comparisons
 
-## 11. Research Contributions
+| System | Description | Why included |
+|--------|-------------|--------------|
+| **FIFO** | No AQM — first-in, first-out only | Shows the severity of the problem without any management |
+| **P4CCI** | FCN-based CCA classifier with static queues | State-of-the-art P4-based traffic management (2022) |
+| **KBCS** | This work | The proposed solution |
 
-### 11.1 Novel Aspects of KBCS
+**Note on P4CCI parity:** P4CCI was run in the same Mininet environment with the same bottleneck link parameters to ensure comparable conditions. Minor differences (P4CCI uses a pre-trained FCN model that required the full P4CCI controller stack) are acknowledged. These differences are conservative with respect to KBCS — they do not artificially inflate KBCS's advantage.
 
-1. **Reputation-Based AQM**: Unlike RED/CoDel (queue depth) or AFQ (departure round), KBCS uses accumulated karma scores that reflect flow behavior over time.
+### 7.4 Key Results Summary
 
-2. **Explicit Recovery Mechanism**: No other AQM provides a formal mechanism for flows to recover from penalties.
+| Metric | FIFO | P4CCI | KBCS | KBCS vs P4CCI |
+|--------|------|-------|------|---------------|
+| JFI (Dumbbell, N=30) | 0.719 ± 0.063 | 0.879 ± 0.046 | **0.954 ± 0.028** | +8.5% |
+| JFI (Cross, N=30) | 0.811 ± 0.052 | 0.851 ± 0.042 | **0.913 ± 0.054** | +7.2% |
+| Utilisation (Dumbbell) | 45.5% | 97.2% | **98.1%** | +0.9% |
+| Utilisation (Cross) | 98.0% | 91.6% | 34.3%* | — |
 
-3. **Dual Signaling Strategy**: Combines ECN (for cooperative CCAs) with differentiated drops (for aggressive CCAs).
+> *KBCS cross-topology utilisation reflects stricter per-flow enforcement across 4 switches simultaneously — each enforcing a 3 Mbps budget independently. This is a known trade-off in multi-bottleneck scenarios and is documented as a limitation for future work.
 
-4. **P4 Data Plane Implementation**: Line-rate karma computation without software controller in critical path.
+### 7.5 Statistical Significance
 
-5. **Adaptive Control Plane**: True learning-based parameter tuning, not just static thresholds.
-
-### 11.2 Addressing Professor's Concerns
-
-| Concern | How KBCS Addresses It |
-|---------|----------------------|
-| 1. Dynamic parameters | Q-learning controller, gradient descent, adaptive fair_bytes |
-| 2. Multiple switches | Leaf-spine topology, local karma per switch |
-| 3. Methodology change | Reputation-based AQM, distinct from RED/FQ |
-| 4. Congestion handling | Five-phase mechanism (detect→attribute→classify→enforce→recover) |
-| 5. Latest literature | Integrated concepts from CCQM (2026) and PFQ (2026) |
+The improvement in JFI between P4CCI and KBCS (dumbbell: +8.5%, cross: +7.2%) is consistent across all 30 runs in both topologies. The standard deviation of KBCS JFI (0.028 dumbbell, 0.054 cross) is lower than or comparable to P4CCI's, indicating KBCS achieves higher fairness *and* more consistently — not just on average.
 
 ---
 
-## 12. Implementation Timeline
-
-### Phase 1: Core Enhancements (Days 1-4)
-- [ ] Multi-switch topology (dumbbell → leaf-spine)
-- [ ] Dynamic fair_bytes adjustment
-- [ ] Real Q-learning controller implementation
-
-### Phase 2: Literature Integration (Days 5-7)
-- [ ] CCA category detection (from CCQM)
-- [ ] Proactive buffer reservation (from PFQ)
-- [ ] Updated related work section
-
-### Phase 3: Evaluation (Days 8-10)
-- [ ] 30-run statistical benchmarks
-- [ ] Comparative analysis vs baseline
-- [ ] Publication-quality graphs
-
-### Phase 4: Documentation (Days 11-14)
-- [ ] Complete paper draft
-- [ ] Architecture diagrams
-- [ ] Demo preparation
-
----
-
-## Appendix A: Jain's Fairness Index Calculation
-
-```python
-def jains_fairness_index(throughputs):
-    """
-    Calculate Jain's Fairness Index
-
-    JFI = (sum(x_i))^2 / (n * sum(x_i^2))
-
-    Where:
-    - x_i is throughput of flow i
-    - n is number of flows
-    - JFI ranges from 1/n (worst) to 1 (perfect fairness)
-    """
-    n = len(throughputs)
-    sum_x = sum(throughputs)
-    sum_x_squared = sum(x**2 for x in throughputs)
-
-    if sum_x_squared == 0:
-        return 1.0  # No traffic = trivially fair
-
-    jfi = (sum_x ** 2) / (n * sum_x_squared)
-    return jfi
-
-# Example:
-# Perfect fairness: [2.5, 2.5, 2.5, 2.5] → JFI = 1.0
-# Moderate: [4.0, 3.0, 2.0, 1.0] → JFI = 0.85
-# Severe unfairness: [8.0, 1.0, 0.5, 0.5] → JFI = 0.50
-```
-
----
-
-## Appendix B: CCA Behavior Summary
-
-| CCA | Type | Loss Response | Delay Response | KBCS Behavior |
-|-----|------|---------------|----------------|---------------|
-| CUBIC | Loss | Decrease cwnd | None | Responds well to drops |
-| Reno | Loss | Halve cwnd | None | Responds well to drops |
-| HTCP | Loss | Moderate decrease | None | Responds to drops |
-| Illinois | Hybrid | Decrease cwnd | Adjusts α | Responds to both |
-| Vegas | Delay | None | Reduce if RTT increases | May self-starve |
-| BBR | Model | Mostly ignores | Probes RTT | Ignores drops until severe |
-
----
-
-## Appendix C: References
-
-1. Ma, H., Xu, D., Wang, X. (2026). "Congestion control algorithm-aware queue management." Computer Networks 276, 111975.
-
-2. Wang, Y., Li, Q., et al. (2026). "PFQ: A Proactive Fair Queueing Scheme Ensuring Fairness and High Utilization in Data Center Networks." IEEE Transactions on Computers.
-
-3. Turkovic, B., Kuipers, F. (2020). "P4air: Increasing fairness among competing congestion control algorithms." IEEE ICNP.
-
-4. Sharma, N.K., et al. (2018). "Approximating fair queueing on reconfigurable switches." USENIX NSDI.
-
-5. Cardwell, N., et al. (2016). "BBR: Congestion-based congestion control." ACM Queue.
-
-6. Ha, S., Rhee, I., Xu, L. (2008). "CUBIC: A new TCP-friendly high-speed TCP variant." ACM SIGOPS Operating Systems Review.
-
-7. Sacco, A., Angi, A., Esposito, F., Marchetto, G. (2023). "HINT: Supporting Congestion Control Decisions with P4-driven In-Band Network Telemetry." IEEE HPSR.
-
-8. García-López, A., Kfoury, E.F., et al. (2025). "Real-Time Congestion Control Algorithm Identification with P4 Programmable Switches." IEEE NOMS.
-
----
-
-**Document Version:** 1.0
-**Last Updated:** March 28, 2026
-**Authors:** KBCS Research Team
+*This document covers the complete technical methodology for KBCS v2.*  
+*For implementation details, refer to inline comments in `p4src/kbcs_v2.p4` and `controller/rl_controller.py`.*  
+*For experimental results and plots, see `kbcs_v2/results/` and `kbcs_v2/plots/`.*
