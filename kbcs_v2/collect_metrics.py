@@ -39,7 +39,8 @@ def main():
     args = parser.parse_args()
 
     # Read per-flow metrics
-    # For cross topology: S1 has flows 1-4, S2 has flows 5-8
+    # For cross topology: S1 has flows 1-4, S2 has flows 5-8 (same fid range)
+    # For twopod:  S1 has flows 1-4 (fid 1-4), S2 has flows 1-4 (fid 1-4, independent domain)
     # For dumbbell: S1 has all flows 1-4
     karma = []
     fwd = []
@@ -51,9 +52,16 @@ def main():
         fwd.append(read_register(9090, "MyIngress.reg_forwarded_bytes", fid))
         drops.append(read_register(9090, "MyEgress.reg_drops", fid))
 
-    # For cross topology, also read flows 5-8 from S2 (port 9091)
+    # For cross topology: read flows 5-8 from S2 (fid 5-8 on S2)
     if args.topo == "cross":
         for fid in range(5, 9):
+            karma.append(read_register(9091, "MyIngress.reg_karma", fid))
+            fwd.append(read_register(9091, "MyIngress.reg_forwarded_bytes", fid))
+            drops.append(read_register(9091, "MyEgress.reg_drops", fid))
+
+    # For twopod: S2 uses independent fid 1-4 (not 5-8)
+    if args.topo == "twopod":
+        for fid in range(1, 5):
             karma.append(read_register(9091, "MyIngress.reg_karma", fid))
             fwd.append(read_register(9091, "MyIngress.reg_forwarded_bytes", fid))
             drops.append(read_register(9091, "MyEgress.reg_drops", fid))
@@ -73,8 +81,8 @@ def main():
     agg_throughput_mbps = (sum_x * 8) / (args.duration * 1_000_000) if args.duration > 0 else 0.0
 
     # Link utilization (bottleneck = 3 Mbps per bottleneck link)
-    # Cross has 2 bottleneck links (6 Mbps total), dumbbell has 1 (3 Mbps)
-    total_link_capacity = 6.0 if args.topo == "cross" else 3.0
+    # Cross/twopod have 2 bottleneck links (6 Mbps total), dumbbell has 1 (3 Mbps)
+    total_link_capacity = 6.0 if args.topo in ("cross", "twopod") else 3.0
     link_util_pct = min((agg_throughput_mbps / total_link_capacity) * 100.0, 100.0)
 
     # Packet Drop Ratio

@@ -2,7 +2,7 @@
 """
 KBCS v2 — Topology Visualizer
 ================================
-Draws the KBCS Two-Tier Multi-Bottleneck Topology using NetworkX
+Draws the KBCS Two-Pod Hierarchical Topology using NetworkX
 and Matplotlib. Can run in two modes:
 
   1. Static PNG  : Saves topology diagram to results/topology.png
@@ -10,12 +10,12 @@ and Matplotlib. Can run in two modes:
 
 This is the "topology visualization tool" required for project submission.
 The diagram shows:
-  - 4 P4 KBCS switches (S1, S2 = access, S3, S4 = aggregation)
+  - 3 P4 KBCS switches (L1, L2 = leaf, CORE = core)
   - 8 sender hosts (H1-H8) with their CCA types labeled
-  - 4 receiver servers (Srv1-Srv4)
-  - Bottleneck links in RED with bandwidth labels
+  - 4 receiver servers (H9-H12)
+  - Bottleneck uplinks in RED with bandwidth labels
   - Access links in BLUE
-  - Cross-links clearly marked between access and aggregation layers
+  - Hierarchical leaf-core architecture
 
 Usage (inside P4 VM):
   python3 topology/visualize.py              # saves PNG only

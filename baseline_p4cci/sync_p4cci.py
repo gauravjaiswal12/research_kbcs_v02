@@ -27,6 +27,7 @@ FILES = [
     'topology.py',
     'topology_4flow.py',
     'topology_cross.py',
+    'topology_twopod.py',
     'evaluate.py',
     'collect_metrics.py',
     'test_suite_p4cci.sh',
@@ -87,6 +88,7 @@ cmds = [
     f'chmod +x {VM_DIR}/test_suite_p4cci.sh',
     f'chmod +x {VM_DIR}/topology_4flow.py',
     f'chmod +x {VM_DIR}/topology_cross.py',
+    f'chmod +x {VM_DIR}/topology_twopod.py',
 ]
 for cmd in cmds:
     stdin, stdout, stderr = ssh.exec_command(cmd)

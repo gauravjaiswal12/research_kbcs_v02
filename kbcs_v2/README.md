@@ -91,37 +91,34 @@ Packet Out (or Dropped)
 
 ### `topology/topology.py` — The Network in Mininet
 
-Creates the **KBCS Two-Tier Multi-Bottleneck Topology** with 4 KBCS switches and cross-links:
+Creates the **KBCS Two-Pod Hierarchical Topology** with 3 KBCS switches (L1, L2, CORE):
 
 ```
-                  Access Layer          Aggregation Layer
+                Leaf Layer                 Core Layer
 
-Host 1 ─┐                                        ┌─ Server 1
-Host 2 ─┤                          ┌── S3 (KBCS)─┤
-Host 3 ─┼── S1 (KBCS) ────────────┤              └─ Server 2
-Host 4 ─┘         ╲               └── S4 (KBCS)─┐
-                    ╲ (cross-link)               ├─ Server 3
-Host 5 ─┐            ╲            ┌── S3 (KBCS)  └─ Server 4
-Host 6 ─┤             ╲           │
-Host 7 ─┼── S2 (KBCS) ────────────┤
-Host 8 ─┘                         └── S4 (KBCS)
+Host 1 ─┐                                           ┌─ Server 1 (H9)
+Host 2 ─┤                               ┌───────────┤
+Host 3 ─┼── L1 (KBCS) ──── 3 Mbps ─────┤            └─ Server 2 (H10)
+Host 4 ─┘                               │  CORE
+                                         │ (KBCS)    ┌─ Server 3 (H11)
+Host 5 ─┐                               │           │
+Host 6 ─┤                               └───────────┤
+Host 7 ─┼── L2 (KBCS) ──── 3 Mbps ──────            └─ Server 4 (H12)
+Host 8 ─┘
 ```
 
-**All bottleneck links are 10 Mbps:**
-- S1 ↔ S3 (direct)
-- S1 ↔ S4 (cross-link)
-- S2 ↔ S3 (cross-link)
-- S2 ↔ S4 (direct)
+**Bottleneck links (2 × 3 Mbps = 6 Mbps total capacity):**
+- L1 → CORE (3 Mbps, `set_queue_rate 250`)
+- L2 → CORE (3 Mbps, `set_queue_rate 250`)
 
-- **H1–H4**: Senders on S1's access side, running CUBIC, BBR, Vegas, Illinois
-- **H5–H8**: Senders on S2's access side, running another mix of CCAs
-- **S1, S2 (Access Layer)**: Run `kbcs_v2.p4`, evaluate all flows from hosts
-- **S3, S4 (Aggregation Layer)**: Run `kbcs_v2.p4`, evaluate flows coming from access switches
-- **Server 1–2**: Connected to S3, running `iperf3` servers
-- **Server 3–4**: Connected to S4, running `iperf3` servers
+- **H1–H4**: Senders on L1 (Pod 1), running CUBIC, BBR, Vegas, Illinois
+- **H5–H8**: Senders on L2 (Pod 2), running CUBIC, BBR, Vegas, Illinois
+- **L1, L2 (Leaf Layer)**: Run `kbcs_v2.p4`, each managing 4 local flows independently
+- **CORE (Core Layer)**: Run `kbcs_v2.p4`, managing all 8 flows aggregated from both pods
+- **H9–H12**: Receiver servers connected to CORE
 
-**What the cross-links prove:**
-A flow from H1 can reach Server 3 via two paths: S1→S3→Server3 OR S1→S4→Server3. This creates realistic multi-path congestion scenarios where different paths have different karma states, and tests whether independent KBCS instances at every switch correctly handle overlapping flows without coordination.
+**What the Two-Pod topology proves:**
+Flows from L1 and L2 converge at the CORE switch, creating a hierarchical multi-bottleneck scenario. Each leaf switch independently enforces fairness within its pod (4 flows each), while the CORE enforces fairness across all 8 flows from both pods. This tests whether independent KBCS instances at different hierarchy levels correctly handle aggregated congestion without coordination.
 
 ---
 
@@ -149,8 +146,8 @@ This Python script runs on the host machine alongside Mininet. It connects to ea
 Reward = 10 × (JFI improvement) + 3 × (link utilization) − 5 × (starvation count)
 ```
 
-The Q-table is shared across both switches. When S1 learns that "increase penalty
-in a high-congestion state improves JFI," S2 benefits from that knowledge too. But
+The Q-table is shared across all switches. When L1 learns that "increase penalty
+in a high-congestion state improves JFI," L2 and CORE benefit from that knowledge too. But
 each switch's parameters are set independently based on its own local JFI reading.
 
 ---

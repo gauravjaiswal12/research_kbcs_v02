@@ -41,7 +41,7 @@ Quantified impact on a ~3 Mbps bottleneck link (measured with no AQM — raw FIF
 |----------|-----------------------|----------------|
 | All CUBIC (4 flows) | ~0.97 | Near-perfect |
 | CUBIC + BBR + Vegas + Illinois | 0.719 | Severe unfairness |
-| Cross topology (8 mixed flows) | 0.811 | Moderate unfairness |
+| Two-Pod topology (8 mixed flows) | 0.736 | Severe unfairness |
 
 A JFI of 0.719 on a 10 Mbps link means some flows receive 6–7x more bandwidth than others despite being allocated the same theoretical share.
 
@@ -69,7 +69,7 @@ P4CCI is the most relevant prior work and the system we benchmark against direct
 
 5. **No proactive buffer management.** P4CCI relies on standard tail-drop or probabilistic AQM within each priority queue. It has no mechanism to dynamically allocate buffer space based on how much each flow actually uses. KBCS integrates PFQ-inspired buffer reservation (see Section 4.9): flows that underuse their budget in a window donate their buffer headroom to active flows, while RED-zone flows are quarantined with a strict threshold of just 2 packets — preventing them from monopolising shared egress buffer during bursts.
 
-**Measured gap:** In 30-run experiments, P4CCI achieves mean JFI of 0.879 (dumbbell) and 0.851 (cross). KBCS achieves 0.954 and 0.913 respectively — an improvement of +8.5% and +7.2% — while maintaining equal or higher link utilisation.
+**Measured gap:** In 30-run experiments, P4CCI achieves mean JFI of 0.879 (dumbbell) and 0.893 (Two-Pod). KBCS achieves 0.954 and 0.927 respectively — an improvement of +8.5% and +3.7% — while maintaining equal or higher link utilisation.
 
 **PFQ (2026):**  
 PFQ proactively reserves buffer space for incoming bursts based on queue depth. It improves incast handling but has **no reputation system**: a flow that has been chronically unfair for the past 10 seconds is treated identically to a new, cooperative flow. **KBCS integrates PFQ's core insight** — dynamic per-flow buffer thresholds and buffer recycling from idle flows — but ties it to the karma system. In KBCS, buffer allocation is not just based on queue depth; it is scaled by the flow's karma-derived color zone, creating a two-dimensional enforcement mechanism: karma controls the *byte budget*, while PFQ controls the *queue depth budget*.
@@ -557,35 +557,35 @@ The simplest inter-CCA fairness scenario. Four sender hosts (H1–H4, each runni
 
 ![KBCS Dumbbell Topology](kbcs_v2/plots/topo_dumbbell.png)
 
-**Cross topology (8 flows, 4 switches, 12 hosts, multi-path):**  
-Eight sender flows (H1–H4 on S1, H5–H8 on S2, two of each CCA) compete across four switches with cross-links between them. Four receiver hosts (H9–H10 on S3, H11–H12 on S4) run iperf servers. Each inter-switch link is independently rate-limited to **~3 Mbps** (250 pps via `set_queue_rate`). Flows can reach receivers via multiple paths, creating scenarios where a single flow is managed simultaneously by two different KBCS switch instances. This tests:
-- Whether independent KBCS instances (no coordination) produce consistent outcomes
-- Whether fairness holds under multi-path contention at reduced per-link capacity
-- Scalability from 4 to 8 competing flows across 4 switches
+**Two-Pod topology (8 flows, 3 switches, 12 hosts, hierarchical):**  
+Eight sender flows (H1–H4 on L1, H5–H8 on L2, two of each CCA) compete across three switches arranged in a leaf-core hierarchy. Four receiver hosts (H9–H12 on CORE) run iperf servers. The two leaf-to-core uplinks are each rate-limited to **~3 Mbps** (250 pps via `set_queue_rate`), giving a total bottleneck capacity of 6 Mbps. Each leaf switch independently enforces karma on its 4 local flows, while the CORE switch manages all 8 aggregated flows. This tests:
+- Whether independent KBCS instances at different hierarchy levels produce consistent fairness
+- Whether fairness holds under hierarchical aggregation at realistic per-link capacity
+- Scalability from 4 to 8 competing flows across a 3-switch leaf-core architecture
 
-![KBCS Cross Topology](kbcs_v2/plots/topo_cross.png)
+![KBCS Two-Pod Topology](kbcs_v2/plots/topo_twopod.png)
 
 ### 6.2 Link Parameters
 
-| Parameter | Dumbbell | Cross |
-|-----------|----------|-------|
-| Switches | 2 (S1, S2) | 4 (S1–S4) |
+| Parameter | Dumbbell | Two-Pod |
+|-----------|----------|---------|
+| Switches | 2 (S1, S2) | 3 (L1, L2, CORE) |
 | Hosts | 8 (H1–H4 senders, H5–H8 receivers) | 12 (H1–H8 senders, H9–H12 receivers) |
 | Access link rate | 100 Mbps | 100 Mbps |
 | Access link delay | 5 ms (netem) | 5 ms (netem) |
-| Bottleneck rate | ~3 Mbps (`set_queue_rate 250` on S1 port 5) | ~3 Mbps per inter-switch link (`set_queue_rate 250` on ports 5, 6) |
+| Bottleneck rate | ~3 Mbps (`set_queue_rate 250` on S1 port 5) | ~3 Mbps per leaf-core link (`set_queue_rate 250` on L1→CORE, L2→CORE) |
 | Bottleneck delay | 5 ms | 5 ms |
 | Queue type | Priority (3 queues) | Priority (3 queues) |
 | Rate enforcement | `simple_switch_CLI set_queue_rate 250` | `simple_switch_CLI set_queue_rate 250` |
 
 ### 6.3 Traffic Parameters
 
-| CCA | Flows in Dumbbell | Flows in Cross | Tool |
-|-----|-------------------|----------------|------|
-| CUBIC | 1 (h1) | 2 (h1, h5) | iperf3 -C cubic |
-| BBR | 1 (h2) | 2 (h2, h6) | iperf3 -C bbr |
-| Vegas | 1 (h3) | 2 (h3, h7) | iperf3 -C vegas |
-| Illinois | 1 (h4) | 2 (h4, h8) | iperf3 -C illinois |
+| CCA | Flows in Dumbbell | Flows in Two-Pod | Tool |
+|-----|-------------------|------------------|------|
+| CUBIC | 1 (h1) | 2 (h1, h5) | iperf -C cubic |
+| BBR | 1 (h2) | 2 (h2, h6) | iperf -C bbr |
+| Vegas | 1 (h3) | 2 (h3, h7) | iperf -C vegas |
+| Illinois | 1 (h4) | 2 (h4, h8) | iperf -C illinois |
 
 Each flow runs for **60 seconds** per experiment. Metrics are collected over the full 60 seconds (not just a steady-state window) to capture startup, convergence, and any transient unfairness.
 
@@ -636,16 +636,19 @@ Each topology × mode combination (FIFO, P4CCI, KBCS) is evaluated over **30 ind
 
 | Metric | FIFO | P4CCI | KBCS | KBCS vs P4CCI |
 |--------|------|-------|------|---------------|
-| JFI (Dumbbell, N=30) | 0.719 ± 0.063 | 0.879 ± 0.046 | **0.954 ± 0.028** | +8.5% |
-| JFI (Cross, N=30) | 0.811 ± 0.052 | 0.851 ± 0.042 | **0.913 ± 0.054** | +7.2% |
-| Utilisation (Dumbbell) | 45.5% | 97.2% | **98.1%** | +0.9% |
-| Utilisation (Cross) | 98.0% | 91.6% | 34.3%* | — |
+| JFI (Dumbbell, N=30) | 0.719 ± 0.077 | 0.879 ± 0.063 | **0.954 ± 0.043** | +8.5% |
+| JFI (Two-Pod, N=30) | 0.736 ± 0.047 | 0.893 ± 0.015 | **0.927 ± 0.017** | +3.7% |
+| Throughput (Dumbbell) | 1.37 Mbps | 2.92 Mbps | **2.95 Mbps** | +1.0% |
+| Throughput (Two-Pod) | 4.32 Mbps | 5.57 Mbps | **5.83 Mbps** | +4.6% |
+| Utilisation (Dumbbell) | 45.5% | 97.2% | **98.1%** | +1.0% |
+| Utilisation (Two-Pod) | 71.9% | 92.9% | **97.2%** | +4.6% |
+| PDR (Two-Pod) | 2.1% | 2.5% | **3.8%** | — |
 
-> *KBCS cross-topology utilisation reflects stricter per-flow enforcement across 4 switches simultaneously — each enforcing a 3 Mbps budget independently. This is a known trade-off in multi-bottleneck scenarios and is documented as a limitation for future work.
+> KBCS achieves the highest JFI and throughput across both topologies. The slightly higher PDR in KBCS (3.8% vs 2.5% for P4CCI) reflects active karma-based enforcement — aggressive flows are intentionally dropped to redistribute bandwidth fairly. This is the expected trade-off of an active fairness system.
 
 ### 7.5 Statistical Significance
 
-The improvement in JFI between P4CCI and KBCS (dumbbell: +8.5%, cross: +7.2%) is consistent across all 30 runs in both topologies. The standard deviation of KBCS JFI (0.028 dumbbell, 0.054 cross) is lower than or comparable to P4CCI's, indicating KBCS achieves higher fairness *and* more consistently — not just on average.
+The improvement in JFI between P4CCI and KBCS (dumbbell: +8.5%, Two-Pod: +3.7%) is consistent across all 30 runs in both topologies. The standard deviation of KBCS JFI (0.043 dumbbell, 0.017 Two-Pod) is lower than or comparable to P4CCI's, indicating KBCS achieves higher fairness *and* more consistently — not just on average.
 
 ---
 

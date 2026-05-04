@@ -6,17 +6,18 @@
 # After each run, calls collect_metrics.py to parse iperf logs and append CSV.
 #
 # Usage:
-#   sudo ./test_suite_p4cci.sh                                   # defaults
+#   sudo ./test_suite_p4cci.sh                                   # defaults (twopod + p4cci)
+#   sudo ./test_suite_p4cci.sh --topo twopod --mode p4cci        # twopod + P4CCI
+#   sudo ./test_suite_p4cci.sh --topo twopod --mode baseline     # twopod + FIFO
 #   sudo ./test_suite_p4cci.sh --topo dumbbell --mode p4cci      # dumbbell + P4CCI
-#   sudo ./test_suite_p4cci.sh --topo cross --mode baseline      # cross + FIFO
-#   sudo ./test_suite_p4cci.sh --topo dumbbell --mode baseline    # dumbbell + FIFO
+#   sudo ./test_suite_p4cci.sh --topo dumbbell --mode baseline   # dumbbell + FIFO
 #   sudo ./test_suite_p4cci.sh --runs 10 --duration 30           # quick test
 #
 # Output CSV files (in results/):
+#   p4cci_twopod_results.csv       -- P4CCI mode, twopod topology
 #   p4cci_dumbbell_results.csv     -- P4CCI mode, dumbbell topology
-#   p4cci_cross_results.csv        -- P4CCI mode, cross topology
+#   baseline_twopod_results.csv    -- Baseline (FIFO), twopod topology
 #   baseline_dumbbell_results.csv  -- Baseline (FIFO), dumbbell topology
-#   baseline_cross_results.csv     -- Baseline (FIFO), cross topology
 # =============================================================================
 
 set -euo pipefail
@@ -25,7 +26,7 @@ set -euo pipefail
 RUNS=30
 DURATION=60
 MODE="p4cci"          # "p4cci" or "baseline"
-TOPO="dumbbell"       # "dumbbell" or "cross"
+TOPO="twopod"         # "twopod" or "dumbbell"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_DIR="${SCRIPT_DIR}/logs"
@@ -43,10 +44,12 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ---- Select topology script ----
-if [[ "$TOPO" == "cross" ]]; then
-    TOPO_SCRIPT="${SCRIPT_DIR}/topology_cross.py"
-else
+if [[ "$TOPO" == "dumbbell" ]]; then
     TOPO_SCRIPT="${SCRIPT_DIR}/topology_4flow.py"
+else
+    # Default: twopod
+    TOPO="twopod"
+    TOPO_SCRIPT="${SCRIPT_DIR}/topology_twopod.py"
 fi
 
 CSV_FILE="${RESULTS_DIR}/${MODE}_${TOPO}_results.csv"

@@ -14,6 +14,7 @@ Metrics computed (same formulas as KBCS collect_metrics.py):
 Topologies supported:
   - dumbbell: 4 flows (h1-h4 -> h5-h8), bottleneck = 3 Mbps
   - cross:    8 flows (h1-h8 -> h9-h12), bottleneck = 6 Mbps (2 x 3 Mbps links)
+  - twopod:   8 flows (h1-h8 -> h9-h12), bottleneck = 6 Mbps (2 x 3 Mbps links)
 
 Usage (called by test_suite_p4cci.sh):
     python3 collect_metrics.py --run 1 --topo dumbbell --mode p4cci \\
@@ -32,6 +33,7 @@ RESULTS_DIR = os.path.join(SCRIPT_DIR, 'results')
 # Bottleneck capacity (250 pps * 1500 B * 8 ~ 3 Mbps per link)
 CAPACITY_DUMBBELL = 3.0    # 1 bottleneck link
 CAPACITY_CROSS    = 6.0    # 2 bottleneck links per ingress switch
+CAPACITY_TWOPOD   = 6.0    # 2 bottleneck links (L1->CORE + L2->CORE)
 
 # Flow definitions per topology
 DUMBBELL_FLOWS = [
@@ -42,6 +44,17 @@ DUMBBELL_FLOWS = [
 ]
 
 CROSS_FLOWS = [
+    ('h1', 'cubic'),
+    ('h2', 'bbr'),
+    ('h3', 'vegas'),
+    ('h4', 'illinois'),
+    ('h5', 'cubic'),
+    ('h6', 'bbr'),
+    ('h7', 'vegas'),
+    ('h8', 'illinois'),
+]
+
+TWOPOD_FLOWS = [
     ('h1', 'cubic'),
     ('h2', 'bbr'),
     ('h3', 'vegas'),
@@ -130,6 +143,9 @@ def collect_and_write(run_num, duration_s, mode, topo, log_dir):
     if topo == 'cross':
         flow_list = CROSS_FLOWS
         capacity  = CAPACITY_CROSS
+    elif topo == 'twopod':
+        flow_list = TWOPOD_FLOWS
+        capacity  = CAPACITY_TWOPOD
     else:
         flow_list = DUMBBELL_FLOWS
         capacity  = CAPACITY_DUMBBELL
@@ -215,7 +231,7 @@ def main():
         description='P4CCI metric collector (KBCS-compatible format)')
     parser.add_argument('--run',      type=int, required=True)
     parser.add_argument('--topo',     type=str, required=True,
-                        choices=['dumbbell', 'cross'])
+                        choices=['dumbbell', 'cross', 'twopod'])
     parser.add_argument('--mode',     type=str, default='p4cci',
                         choices=['baseline', 'p4cci'])
     parser.add_argument('--duration', type=int, default=60)

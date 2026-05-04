@@ -80,7 +80,15 @@ def compute_stats(values):
     std = np.std(values, ddof=1) if n > 1 else 0
     t_val = 2.045 if n >= 30 else 2.262
     se = std / math.sqrt(n)
-    return {'mean': mean, 'std': std, 'ci_lo': mean - t_val * se, 'ci_hi': mean + t_val * se, 'n': n}
+    return {'mean': mean, 'std': std, 'ci_lo': mean - t_val * se, 'ci_hi': mean + t_val * se, 'ci_err': t_val * se, 'n': n}
+
+def get_ci_error(values):
+    n = len(values)
+    if n == 0:
+        return 0
+    std = np.std(values, ddof=1) if n > 1 else 0
+    t_val = 2.045 if n >= 30 else 2.262
+    return t_val * (std / math.sqrt(n))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -89,7 +97,7 @@ def compute_stats(values):
 def plot_jfi_3way(fifo_d, p4cci_d, kbcs_d, fifo_c, p4cci_c, kbcs_c):
     fig, ax = plt.subplots(figsize=(9, 5.5))
 
-    groups = ['Dumbbell\n(4 flows)', 'Cross\n(8 flows)']
+    groups = ['Dumbbell\n(4 flows)', 'Two-Pod\n(8 flows)']
     x = np.arange(len(groups))
     width = 0.22
 
@@ -103,13 +111,13 @@ def plot_jfi_3way(fifo_d, p4cci_d, kbcs_d, fifo_c, p4cci_c, kbcs_c):
 
     for i, (key, col, lbl) in enumerate(zip(data.keys(), colors, labels)):
         means = [np.mean(v) if v else 0 for v in data[key]]
-        stds  = [np.std(v) if v else 0 for v in data[key]]
-        bars = ax.bar(x + (i - 1) * width, means, width, yerr=stds,
+        cis   = [get_ci_error(v) for v in data[key]]
+        bars = ax.bar(x + (i - 1) * width, means, width, yerr=cis,
                       label=lbl, color=col, alpha=0.88, capsize=4,
                       edgecolor='white', linewidth=1.2)
         # Value labels on bars
-        for j, (m, s) in enumerate(zip(means, stds)):
-            ax.text(x[j] + (i - 1) * width, m + s + 0.008, f'{m:.3f}',
+        for j, (m, c) in enumerate(zip(means, cis)):
+            ax.text(x[j] + (i - 1) * width, m + c + 0.008, f'{m:.3f}',
                     ha='center', va='bottom', fontsize=9, fontweight='bold', color=col)
 
     ax.set_ylabel("Jain's Fairness Index (JFI)")
@@ -133,7 +141,7 @@ def plot_jfi_3way(fifo_d, p4cci_d, kbcs_d, fifo_c, p4cci_c, kbcs_c):
 def plot_throughput_3way(fifo_d, p4cci_d, kbcs_d, fifo_c, p4cci_c, kbcs_c):
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
 
-    groups = ['Dumbbell', 'Cross']
+    groups = ['Dumbbell', 'Two-Pod']
     x = np.arange(len(groups))
     width = 0.22
     colors = [FIFO_COLOR, P4CCI_COLOR, KBCS_COLOR]
@@ -147,11 +155,11 @@ def plot_throughput_3way(fifo_d, p4cci_d, kbcs_d, fifo_c, p4cci_c, kbcs_c):
     }
     for i, (key, col, lbl) in enumerate(zip(tp_data.keys(), colors, labels)):
         means = [np.mean(v) if v else 0 for v in tp_data[key]]
-        stds  = [np.std(v) if v else 0 for v in tp_data[key]]
-        ax1.bar(x + (i - 1) * width, means, width, yerr=stds,
+        cis   = [get_ci_error(v) for v in tp_data[key]]
+        ax1.bar(x + (i - 1) * width, means, width, yerr=cis,
                 label=lbl, color=col, alpha=0.88, capsize=4, edgecolor='white', linewidth=1.2)
-        for j, (m, s) in enumerate(zip(means, stds)):
-            ax1.text(x[j] + (i - 1) * width, m + s + 0.05, f'{m:.2f}',
+        for j, (m, c) in enumerate(zip(means, cis)):
+            ax1.text(x[j] + (i - 1) * width, m + c + 0.05, f'{m:.2f}',
                      ha='center', va='bottom', fontsize=8, fontweight='bold', color=col)
 
     ax1.set_ylabel('Aggregate Throughput (Mbps)')
@@ -168,11 +176,11 @@ def plot_throughput_3way(fifo_d, p4cci_d, kbcs_d, fifo_c, p4cci_c, kbcs_c):
     }
     for i, (key, col, lbl) in enumerate(zip(lu_data.keys(), colors, labels)):
         means = [np.mean(v) if v else 0 for v in lu_data[key]]
-        stds  = [np.std(v) if v else 0 for v in lu_data[key]]
-        ax2.bar(x + (i - 1) * width, means, width, yerr=stds,
+        cis   = [get_ci_error(v) for v in lu_data[key]]
+        ax2.bar(x + (i - 1) * width, means, width, yerr=cis,
                 label=lbl, color=col, alpha=0.88, capsize=4, edgecolor='white', linewidth=1.2)
-        for j, (m, s) in enumerate(zip(means, stds)):
-            ax2.text(x[j] + (i - 1) * width, m + s + 0.5, f'{m:.1f}%',
+        for j, (m, c) in enumerate(zip(means, cis)):
+            ax2.text(x[j] + (i - 1) * width, m + c + 0.5, f'{m:.1f}%',
                      ha='center', va='bottom', fontsize=8, fontweight='bold', color=col)
 
     ax2.set_ylabel('Link Utilization (%)')
@@ -215,7 +223,7 @@ def plot_jfi_boxplot(fifo_d, p4cci_d, kbcs_d, fifo_c, p4cci_c, kbcs_c):
         patch.set_facecolor(color)
         patch.set_alpha(0.7)
     ax2.set_ylabel("Jain's Fairness Index")
-    ax2.set_title('Cross Topology (8 Flows)')
+    ax2.set_title('Two-Pod Topology (8 Flows)')
     ax2.set_ylim(0.5, 1.05)
     ax2.axhline(y=1.0, color='gray', linestyle='--', alpha=0.4)
 
@@ -235,7 +243,7 @@ def plot_jfi_over_runs(fifo_d, p4cci_d, kbcs_d, fifo_c, p4cci_c, kbcs_c):
 
     for ax, title, fifo, p4cci, kbcs in [
         (ax1, 'Dumbbell Topology', fifo_d, p4cci_d, kbcs_d),
-        (ax2, 'Cross Topology', fifo_c, p4cci_c, kbcs_c)
+        (ax2, 'Two-Pod Topology', fifo_c, p4cci_c, kbcs_c)
     ]:
         runs = range(1, 31)
         fifo_jfi = get_metric(fifo, 'jfi')[:30]
@@ -279,7 +287,7 @@ def plot_multi_metric_3way(fifo_d, p4cci_d, kbcs_d, fifo_c, p4cci_c, kbcs_c):
     # 4th panel = summary text table
     ax_table = axes[1, 1]
 
-    groups = ['Dumbbell', 'Cross']
+    groups = ['Dumbbell', 'Two-Pod']
     x = np.arange(len(groups))
     width = 0.22
     colors = [FIFO_COLOR, P4CCI_COLOR, KBCS_COLOR]
@@ -296,8 +304,8 @@ def plot_multi_metric_3way(fifo_d, p4cci_d, kbcs_d, fifo_c, p4cci_c, kbcs_c):
             d_vals = get_metric(all_datasets[name]['d'], key)
             c_vals = get_metric(all_datasets[name]['c'], key)
             means = [np.mean(d_vals) if d_vals else 0, np.mean(c_vals) if c_vals else 0]
-            stds  = [np.std(d_vals) if d_vals else 0, np.std(c_vals) if c_vals else 0]
-            ax.bar(x + (i - 1) * width, means, width, yerr=stds,
+            cis   = [get_ci_error(d_vals), get_ci_error(c_vals)]
+            ax.bar(x + (i - 1) * width, means, width, yerr=cis,
                    label=lbl, color=col, alpha=0.85, capsize=4, edgecolor='white', linewidth=1)
         ax.set_title(title)
         ax.set_xticks(x)
@@ -307,7 +315,7 @@ def plot_multi_metric_3way(fifo_d, p4cci_d, kbcs_d, fifo_c, p4cci_c, kbcs_c):
     # Summary text table in 4th panel
     ax_table.axis('off')
     table_data = []
-    for topo, label in [('d', 'Dumbbell'), ('c', 'Cross')]:
+    for topo, label in [('d', 'Dumbbell'), ('c', 'Two-Pod')]:
         fifo_jfi = np.mean(get_metric(all_datasets['FIFO'][topo], 'jfi'))
         p4cci_jfi = np.mean(get_metric(all_datasets['P4CCI'][topo], 'jfi'))
         kbcs_jfi = np.mean(get_metric(all_datasets['KBCS'][topo], 'jfi'))
@@ -350,7 +358,7 @@ def print_summary_table(fifo_d, p4cci_d, kbcs_d, fifo_c, p4cci_c, kbcs_c):
 
     for topo_label, fifo, p4cci, kbcs in [
         ('Dumbbell', fifo_d, p4cci_d, kbcs_d),
-        ('Cross', fifo_c, p4cci_c, kbcs_c)
+        ('Two-Pod', fifo_c, p4cci_c, kbcs_c)
     ]:
         metrics = [
             ("JFI", 'jfi'),
@@ -390,15 +398,15 @@ def main():
 
     # Load all CSVs
     kbcs_d  = load_csv(os.path.join(RESULTS_DIR, 'dumbbell_results.csv'))
-    kbcs_c  = load_csv(os.path.join(RESULTS_DIR, 'cross_results.csv'))
+    kbcs_c  = load_csv(os.path.join(RESULTS_DIR, 'twopod_results.csv'))
     fifo_d  = load_csv(os.path.join(RESULTS_DIR, 'fifo_dumbbell_results.csv'))
-    fifo_c  = load_csv(os.path.join(RESULTS_DIR, 'fifo_cross_results.csv'))
+    fifo_c  = load_csv(os.path.join(RESULTS_DIR, 'fifo_twopod_results.csv'))
     p4cci_d = load_csv(os.path.join(RESULTS_DIR, 'p4cci_dumbbell_results.csv'))
-    p4cci_c = load_csv(os.path.join(RESULTS_DIR, 'p4cci_cross_results.csv'))
+    p4cci_c = load_csv(os.path.join(RESULTS_DIR, 'p4cci_twopod_results.csv'))
 
-    print(f"  KBCS  Dumbbell: {len(kbcs_d)} runs | Cross: {len(kbcs_c)} runs")
-    print(f"  FIFO  Dumbbell: {len(fifo_d)} runs | Cross: {len(fifo_c)} runs")
-    print(f"  P4CCI Dumbbell: {len(p4cci_d)} runs | Cross: {len(p4cci_c)} runs")
+    print(f"  KBCS  Dumbbell: {len(kbcs_d)} runs | Two-Pod: {len(kbcs_c)} runs")
+    print(f"  FIFO  Dumbbell: {len(fifo_d)} runs | Two-Pod: {len(fifo_c)} runs")
+    print(f"  P4CCI Dumbbell: {len(p4cci_d)} runs | Two-Pod: {len(p4cci_c)} runs")
     print()
 
     if not all([kbcs_d, kbcs_c, fifo_d, fifo_c, p4cci_d, p4cci_c]):

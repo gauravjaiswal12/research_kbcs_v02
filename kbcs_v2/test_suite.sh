@@ -5,9 +5,10 @@
 # Runs the experiment N times (default 30), each for RUN_DURATION seconds.
 # After each run, calls collect_metrics.py to read registers and append to CSV.
 # Usage:
-#   bash test_suite.sh                          # 30 runs, 60s each, cross-topo
+#   bash test_suite.sh                          # 30 runs, 60s each, twopod-topo
 #   bash test_suite.sh --runs 10 --duration 60  # 10 runs, 60s each
 #   bash test_suite.sh --topo dumbbell          # dumbbell topology
+#   bash test_suite.sh --topo twopod            # two-pod topology (default)
 #   bash test_suite.sh --mode fifo              # FIFO baseline (no KBCS)
 # ============================================================================
 
@@ -18,7 +19,7 @@ VENV_PYTHON=/home/p4/src/p4dev-python-venv/bin/python3
 # Defaults
 NUM_RUNS=30
 RUN_DURATION=60
-TOPO="cross"      # "cross" or "dumbbell"
+TOPO="twopod"     # "twopod" or "dumbbell"
 MODE="kbcs"       # "kbcs" or "fifo"
 
 # Parse args
@@ -59,12 +60,14 @@ IEOF
 )
     RL_CMD="python3 controller/rl_controller.py --flows 1,2,3,4 --duration $RUN_DURATION --switches 9090 --reset"
 else
-    TOPO_JSON="kbcs-topo/topology.json"
-    CSV_FILE="results/${CSV_PREFIX}cross_results.csv"
-    THRIFT_PORTS="9090 9091 9092 9093"
-    SWITCH_COUNT=4
+    # Default: Two-Pod topology (3 switches: L1, L2, CORE)
+    TOPO="twopod"
+    TOPO_JSON="kbcs-topo/twopod_topology.json"
+    CSV_FILE="results/${CSV_PREFIX}twopod_results.csv"
+    THRIFT_PORTS="9090 9091 9092"
+    SWITCH_COUNT=3
     IPERF_CMDS=$(cat <<'IEOF'
-h9 iperf -s -D
+h9  iperf -s -D
 h10 iperf -s -D
 h11 iperf -s -D
 h12 iperf -s -D
@@ -79,7 +82,7 @@ h7 iperf -c 10.0.4.2 -t __DUR__ -P 1 &
 h8 iperf -c 10.0.4.2 -t __DUR__ -P 1 &
 IEOF
 )
-    RL_CMD="python3 controller/rl_controller.py --flows 1,2,3,4 --duration $RUN_DURATION --switches 9090 --reset"
+    RL_CMD="bash -c 'python3 controller/rl_controller.py --flows 1,2,3,4 --duration $RUN_DURATION --switches 9090 --reset > /tmp/kbcs_test_rl1.log 2>&1 & python3 controller/rl_controller.py --flows 1,2,3,4 --duration $RUN_DURATION --switches 9091 --reset > /tmp/kbcs_test_rl2.log 2>&1 & python3 controller/rl_controller.py --flows 1,2,3,4,5,6,7,8 --duration $RUN_DURATION --switches 9092 --reset > /tmp/kbcs_test_rl_core.log 2>&1 & wait'"
 fi
 
 # Replace duration placeholder
@@ -172,7 +175,7 @@ MNEOF
         RL_PID=""
     else
         echo "  [4/5] Starting RL controller..."
-        $RL_CMD > /tmp/kbcs_test_rl.log 2>&1 &
+        eval "$RL_CMD" > /tmp/kbcs_test_rl.log 2>&1 &
         RL_PID=$!
     fi
 
