@@ -99,7 +99,7 @@ def plot_jfi_3way(fifo_d, p4cci_d, kbcs_d, fifo_c, p4cci_c, kbcs_c):
         'KBCS':  [get_metric(kbcs_d, 'jfi'),  get_metric(kbcs_c, 'jfi')],
     }
     colors = [FIFO_COLOR, P4CCI_COLOR, KBCS_COLOR]
-    labels = ['FIFO (No Fairness)', 'P4CCI (Static Queues)', 'KBCS (Ours)']
+    labels = ['FIFO (No Fairness)', 'P4CCI [X]', 'Proposed']
 
     for i, (key, col, lbl) in enumerate(zip(data.keys(), colors, labels)):
         means = [np.mean(v) if v else 0 for v in data[key]]
@@ -137,7 +137,7 @@ def plot_throughput_3way(fifo_d, p4cci_d, kbcs_d, fifo_c, p4cci_c, kbcs_c):
     x = np.arange(len(groups))
     width = 0.22
     colors = [FIFO_COLOR, P4CCI_COLOR, KBCS_COLOR]
-    labels = ['FIFO', 'P4CCI', 'KBCS (Ours)']
+    labels = ['FIFO', 'P4CCI [X]', 'Proposed']
 
     # Throughput
     tp_data = {
@@ -197,7 +197,7 @@ def plot_jfi_boxplot(fifo_d, p4cci_d, kbcs_d, fifo_c, p4cci_c, kbcs_c):
 
     # Dumbbell
     dbell_data = [get_metric(fifo_d, 'jfi'), get_metric(p4cci_d, 'jfi'), get_metric(kbcs_d, 'jfi')]
-    bp1 = ax1.boxplot(dbell_data, patch_artist=True, tick_labels=['FIFO', 'P4CCI', 'KBCS'],
+    bp1 = ax1.boxplot(dbell_data, patch_artist=True, tick_labels=['FIFO', 'P4CCI [X]', 'Proposed'],
                        widths=0.5, showmeans=True, meanprops=dict(marker='D', markerfacecolor='black', markersize=6))
     for patch, color in zip(bp1['boxes'], [FIFO_COLOR, P4CCI_COLOR, KBCS_COLOR]):
         patch.set_facecolor(color)
@@ -209,7 +209,7 @@ def plot_jfi_boxplot(fifo_d, p4cci_d, kbcs_d, fifo_c, p4cci_c, kbcs_c):
 
     # Cross
     cross_data = [get_metric(fifo_c, 'jfi'), get_metric(p4cci_c, 'jfi'), get_metric(kbcs_c, 'jfi')]
-    bp2 = ax2.boxplot(cross_data, patch_artist=True, tick_labels=['FIFO', 'P4CCI', 'KBCS'],
+    bp2 = ax2.boxplot(cross_data, patch_artist=True, tick_labels=['FIFO', 'P4CCI [X]', 'Proposed'],
                        widths=0.5, showmeans=True, meanprops=dict(marker='D', markerfacecolor='black', markersize=6))
     for patch, color in zip(bp2['boxes'], [FIFO_COLOR, P4CCI_COLOR, KBCS_COLOR]):
         patch.set_facecolor(color)
@@ -243,8 +243,8 @@ def plot_jfi_over_runs(fifo_d, p4cci_d, kbcs_d, fifo_c, p4cci_c, kbcs_c):
         kbcs_jfi = get_metric(kbcs, 'jfi')[:30]
 
         ax.plot(runs, fifo_jfi, 'o-', color=FIFO_COLOR, alpha=0.7, markersize=4, label='FIFO')
-        ax.plot(runs, p4cci_jfi, 's-', color=P4CCI_COLOR, alpha=0.7, markersize=4, label='P4CCI')
-        ax.plot(runs, kbcs_jfi, '^-', color=KBCS_COLOR, alpha=0.7, markersize=4, label='KBCS (Ours)')
+        ax.plot(runs, p4cci_jfi, 's-', color=P4CCI_COLOR, alpha=0.7, markersize=4, label='P4CCI [X]')
+        ax.plot(runs, kbcs_jfi, '^-', color=KBCS_COLOR, alpha=0.7, markersize=4, label='Proposed')
 
         # Mean lines
         ax.axhline(y=np.mean(fifo_jfi), color=FIFO_COLOR, linestyle=':', alpha=0.5)
@@ -283,7 +283,7 @@ def plot_multi_metric_3way(fifo_d, p4cci_d, kbcs_d, fifo_c, p4cci_c, kbcs_c):
     x = np.arange(len(groups))
     width = 0.22
     colors = [FIFO_COLOR, P4CCI_COLOR, KBCS_COLOR]
-    labels = ['FIFO', 'P4CCI', 'KBCS']
+    labels = ['FIFO', 'P4CCI [X]', 'Proposed']
 
     all_datasets = {
         'FIFO':  {'d': fifo_d,  'c': fifo_c},
@@ -318,7 +318,7 @@ def plot_multi_metric_3way(fifo_d, p4cci_d, kbcs_d, fifo_c, p4cci_c, kbcs_c):
 
     table = ax_table.table(
         cellText=table_data,
-        colLabels=['Topology', 'FIFO', 'P4CCI', 'KBCS', 'KBCS vs\nP4CCI'],
+        colLabels=['Topology', 'FIFO', 'P4CCI [X]', 'Proposed', 'Proposed vs\nP4CCI'],
         cellLoc='center', loc='center',
         colColours=['#E5E7EB', '#FECACA', '#FDE68A', '#BFDBFE', '#D1FAE5']
     )
